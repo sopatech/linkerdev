@@ -14,8 +14,6 @@ import (
 	"time"
 )
 
-const version = "dev"
-
 /*
 Framed protocol (big-endian):
   byte  type
