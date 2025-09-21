@@ -37,12 +37,20 @@ jobs:
           # Test relay
           cd ../relay && go test ./...
 
-      - name: Build CLI binary
+      - name: Build CLI binaries
         run: |
           VERSION="${{ github.ref_name }}"
           echo "Building CLI release version: $VERSION"
           cd cmd/cli
-          go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev .
+          
+          # Build for Linux (amd64)
+          GOOS=linux GOARCH=amd64 go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev-linux-amd64 .
+          
+          # Build for macOS (amd64)
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev-darwin-amd64 .
+          
+          # Build for macOS (arm64)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev-darwin-arm64 .
 
       - name: Build relay binary
         run: |
@@ -68,13 +76,15 @@ jobs:
       - name: Build and push relay image
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-          docker build -f cmd/relay/Dockerfile -t ${{ env.DOCKER_IMAGE }}:$VERSION .
-          docker tag ${{ env.DOCKER_IMAGE }}:$VERSION ${{ env.DOCKER_IMAGE }}:latest
-          docker push ${{ env.DOCKER_IMAGE }}:$VERSION
-          docker push ${{ env.DOCKER_IMAGE }}:latest
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f cmd/relay/Dockerfile \
+            -t ${{ env.DOCKER_IMAGE }}:$VERSION \
+            -t ${{ env.DOCKER_IMAGE }}:latest \
+            --push .
           echo "Built and pushed relay images:"
-          echo "- ${{ env.DOCKER_IMAGE }}:$VERSION"
-          echo "- ${{ env.DOCKER_IMAGE }}:latest"
+          echo "- ${{ env.DOCKER_IMAGE }}:$VERSION (linux/amd64, linux/arm64)"
+          echo "- ${{ env.DOCKER_IMAGE }}:latest (linux/amd64, linux/arm64)"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
@@ -86,7 +96,9 @@ jobs:
             ## linkerdev ${{ steps.version.outputs.VERSION }}
 
             ### Binaries
-            - `linkerdev` - CLI tool for local development
+            - `linkerdev-linux-amd64` - CLI tool for Linux (amd64)
+            - `linkerdev-darwin-amd64` - CLI tool for macOS (Intel)
+            - `linkerdev-darwin-arm64` - CLI tool for macOS (Apple Silicon)
 
             ### Docker Images
             - `ghcr.io/${{ github.repository }}-relay:${{ steps.version.outputs.VERSION }}`
@@ -109,6 +121,8 @@ jobs:
             ### Changes
             See the [changelog](https://github.com/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.sha }}) for details.
           files: |
-            bin/linkerdev
+            bin/linkerdev-linux-amd64
+            bin/linkerdev-darwin-amd64
+            bin/linkerdev-darwin-arm64
           draft: false
           prerelease: false
