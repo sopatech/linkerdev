@@ -1,7 +1,14 @@
 # syntax=docker/dockerfile:1
 
-# Accept the pre-built binary path as build argument
-ARG BINARY_PATH=bin/linkerdev-relay-linux-amd64
+# Use Docker's automatic build arguments to determine target platform
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+# Binary path prefix (set by build process)
+ARG BINARY_PREFIX=bin/linkerdev-relay
+
+# Dynamically construct the binary path based on target platform
+ARG BINARY_PATH=${BINARY_PREFIX}-${TARGETOS}-${TARGETARCH}
 
 # Runtime
 FROM gcr.io/distroless/static:nonroot
