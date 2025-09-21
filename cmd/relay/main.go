@@ -39,7 +39,7 @@ Server behavior:
 - If CONTROL drops: all streams are closed & reset.
 */
 
-var version = "dev"
+var version = "v0.1.0-alpha6"
 
 const (
 	tOpen  = 0x01
@@ -108,14 +108,13 @@ func main() {
 	}
 }
 
-
 func (rs *relayServer) runControlListener() {
 	ln, err := net.Listen("tcp", rs.ctrlAddr)
 	if err != nil {
 		log.Fatalf("control listen: %v", err)
 	}
 	defer ln.Close()
-	
+
 	log.Printf("control listener on %s", rs.ctrlAddr)
 	for {
 		c, err := ln.Accept()
@@ -126,13 +125,13 @@ func (rs *relayServer) runControlListener() {
 			log.Printf("control accept: %v", err)
 			continue
 		}
-		
+
 		// Check if this is an HTTP request by peeking at the first few bytes
 		c.SetReadDeadline(time.Now().Add(1 * time.Second))
 		buf := make([]byte, 4)
 		n, err := c.Read(buf)
 		c.SetReadDeadline(time.Time{}) // Clear deadline
-		
+
 		if err == nil && n >= 4 && string(buf[:4]) == "GET " {
 			// This is an HTTP request, handle it
 			go rs.handleHTTP(c, buf)
@@ -145,26 +144,26 @@ func (rs *relayServer) runControlListener() {
 
 func (rs *relayServer) handleHTTP(conn net.Conn, firstBytes []byte) {
 	defer conn.Close()
-	
+
 	// Read the rest of the HTTP request
 	reader := bufio.NewReader(io.MultiReader(
 		strings.NewReader(string(firstBytes)),
 		conn,
 	))
-	
+
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		log.Printf("HTTP request error: %v", err)
 		return
 	}
-	
+
 	// Handle health check
 	if req.URL.Path == "/healthz" {
 		response := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
 		conn.Write([]byte(response))
 		return
 	}
-	
+
 	// Handle other requests with 404
 	response := "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nNot Found"
 	conn.Write([]byte(response))
