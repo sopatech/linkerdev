@@ -79,17 +79,48 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Build and push multi-platform relay image
+      - name: Build and push relay image (amd64)
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
           docker buildx build \
-            --platform linux/amd64,linux/arm64 \
+            --platform linux/amd64 \
             -f cmd/relay/Dockerfile \
             --build-arg BINARY_PREFIX=bin/linkerdev-relay \
-            -t ${{ env.DOCKER_IMAGE }}:$VERSION \
-            -t ${{ env.DOCKER_IMAGE }}:latest \
+            --build-arg TARGETOS=linux \
+            --build-arg TARGETARCH=amd64 \
+            -t ${{ env.DOCKER_IMAGE }}:$VERSION-amd64 \
             --push .
-          echo "Built and pushed multi-platform relay image: ${{ env.DOCKER_IMAGE }}:$VERSION and ${{ env.DOCKER_IMAGE }}:latest"
+          echo "Built and pushed relay image: ${{ env.DOCKER_IMAGE }}:$VERSION-amd64"
+
+      - name: Build and push relay image (arm64)
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          docker buildx build \
+            --platform linux/arm64 \
+            -f cmd/relay/Dockerfile \
+            --build-arg BINARY_PREFIX=bin/linkerdev-relay \
+            --build-arg TARGETOS=linux \
+            --build-arg TARGETARCH=arm64 \
+            -t ${{ env.DOCKER_IMAGE }}:$VERSION-arm64 \
+            --push .
+          echo "Built and pushed relay image: ${{ env.DOCKER_IMAGE }}:$VERSION-arm64"
+
+      - name: Create and push multi-arch manifest
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          # Create manifest for version tag
+          docker manifest create ${{ env.DOCKER_IMAGE }}:$VERSION \
+            ${{ env.DOCKER_IMAGE }}:$VERSION-amd64 \
+            ${{ env.DOCKER_IMAGE }}:$VERSION-arm64
+          docker manifest push ${{ env.DOCKER_IMAGE }}:$VERSION
+          
+          # Create manifest for latest tag
+          docker manifest create ${{ env.DOCKER_IMAGE }}:latest \
+            ${{ env.DOCKER_IMAGE }}:$VERSION-amd64 \
+            ${{ env.DOCKER_IMAGE }}:$VERSION-arm64
+          docker manifest push ${{ env.DOCKER_IMAGE }}:latest
+          
+          echo "Created multi-arch manifests for ${{ env.DOCKER_IMAGE }}:$VERSION and ${{ env.DOCKER_IMAGE }}:latest"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
