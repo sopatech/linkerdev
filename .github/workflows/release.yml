@@ -82,23 +82,21 @@ jobs:
       - name: Build and push relay image (amd64)
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-          docker buildx build \
-            --platform linux/amd64 \
+          docker build \
             -f cmd/relay/Dockerfile \
             --build-arg BINARY_PATH=bin/linkerdev-relay-linux-amd64 \
-            -t ${{ env.DOCKER_IMAGE }}:$VERSION-amd64 \
-            --push .
+            -t ${{ env.DOCKER_IMAGE }}:$VERSION-amd64 .
+          docker push ${{ env.DOCKER_IMAGE }}:$VERSION-amd64
           echo "Built and pushed relay image: ${{ env.DOCKER_IMAGE }}:$VERSION-amd64"
 
       - name: Build and push relay image (arm64)
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-          docker buildx build \
-            --platform linux/arm64 \
+          docker build \
             -f cmd/relay/Dockerfile \
             --build-arg BINARY_PATH=bin/linkerdev-relay-linux-arm64 \
-            -t ${{ env.DOCKER_IMAGE }}:$VERSION-arm64 \
-            --push .
+            -t ${{ env.DOCKER_IMAGE }}:$VERSION-arm64 .
+          docker push ${{ env.DOCKER_IMAGE }}:$VERSION-arm64
           echo "Built and pushed relay image: ${{ env.DOCKER_IMAGE }}:$VERSION-arm64"
 
       - name: Create and push multi-arch manifest
