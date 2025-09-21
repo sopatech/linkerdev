@@ -37,7 +37,7 @@ This will download, build, and install the latest version to your `$GOPATH/bin` 
 ```bash
 git clone https://github.com/sopatech/linkerdev.git
 cd linkerdev
-go install ./cmd/cli
+go install ./cmd/linkerdev
 ```
 
 ### Install the Relay Component
@@ -174,7 +174,7 @@ linkerdev -v -svc my-service.apps -p 8080 go run main.go
 
 ```bash
 # Build CLI
-cd cmd/cli
+cd cmd/linkerdev
 go build -o linkerdev .
 
 # Build relay
