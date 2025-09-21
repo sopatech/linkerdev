@@ -52,12 +52,6 @@ jobs:
           # Build for macOS (arm64)
           GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev-darwin-arm64 .
 
-      - name: Build relay binary
-        run: |
-          VERSION="${{ github.ref_name }}"
-          echo "Building relay release version: $VERSION"
-          cd cmd/relay
-          go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev-relay .
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
