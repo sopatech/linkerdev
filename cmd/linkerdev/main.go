@@ -52,7 +52,31 @@ import (
 
 /* ---------- Config / constants ---------- */
 
-var version = "dev"
+var version = getVersion()
+
+func getVersion() string {
+	// Try to get version from git tag
+	if version := getGitVersion(); version != "" {
+		return version
+	}
+	// Fallback to "dev" if not in a git repo or no tag
+	return "dev"
+}
+
+func getGitVersion() string {
+	// Try to get the current git tag
+	cmd := exec.Command("git", "describe", "--tags", "--exact-match", "HEAD")
+	output, err := cmd.Output()
+	if err != nil {
+		// If no exact tag, try to get the latest tag
+		cmd = exec.Command("git", "describe", "--tags", "--abbrev=0")
+		output, err = cmd.Output()
+		if err != nil {
+			return ""
+		}
+	}
+	return strings.TrimSpace(string(output))
+}
 
 const (
 	// Labels
