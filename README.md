@@ -22,7 +22,7 @@ linkerdev consists of two components:
 ### Using Go Install (Recommended)
 
 ```bash
-go install github.com/sopatech/linkerdev/cmd/cli
+go install github.com/sopatech/linkerdev/cmd/linkerdev@latest
 ```
 
 This will download, build, and install the latest version to your `$GOPATH/bin` directory.

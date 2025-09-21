@@ -33,7 +33,7 @@ jobs:
       - name: Run tests
         run: |
           # Test CLI
-          cd cmd/cli && go test ./...
+          cd cmd/linkerdev && go test ./...dev
           # Test relay
           cd ../relay && go test ./...
 
@@ -41,7 +41,7 @@ jobs:
         run: |
           VERSION="${{ github.ref_name }}"
           echo "Building CLI release version: $VERSION"
-          cd cmd/cli
+          cd cmd/linkerdev
           
           # Build for Linux (amd64)
           GOOS=linux GOARCH=amd64 go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev-linux-amd64 .
