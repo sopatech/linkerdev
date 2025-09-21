@@ -1,0 +1,115 @@
+name: Release
+
+# Trigger on version tags
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GO_VERSION: '1.25.1'
+  DOCKER_IMAGE: ghcr.io/sopatech/linkerdev-relay
+  REGISTRY: ghcr.io
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: |
+          # Test CLI
+          cd cmd/cli && go test ./...
+          # Test relay
+          cd ../relay && go test ./...
+
+      - name: Build CLI binary
+        run: |
+          VERSION="${{ github.ref_name }}"
+          echo "Building CLI release version: $VERSION"
+          cd cmd/cli
+          go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev .
+
+      - name: Build relay binary
+        run: |
+          VERSION="${{ github.ref_name }}"
+          echo "Building relay release version: $VERSION"
+          cd cmd/relay
+          go build -ldflags="-X main.version=$VERSION" -o ../../bin/linkerdev-relay .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build and push relay image
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          cd cmd/relay
+          docker build -t ${{ env.DOCKER_IMAGE }}:$VERSION .
+          docker tag ${{ env.DOCKER_IMAGE }}:$VERSION ${{ env.DOCKER_IMAGE }}:latest
+          docker push ${{ env.DOCKER_IMAGE }}:$VERSION
+          docker push ${{ env.DOCKER_IMAGE }}:latest
+          echo "Built and pushed relay images:"
+          echo "- ${{ env.DOCKER_IMAGE }}-relay:$VERSION"
+          echo "- ${{ env.DOCKER_IMAGE }}-relay:latest"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          body: |
+            ## linkerdev ${{ steps.version.outputs.VERSION }}
+
+            ### Binaries
+            - `linkerdev` - CLI tool for local development
+
+            ### Docker Images
+            - `ghcr.io/${{ github.repository }}-relay:${{ steps.version.outputs.VERSION }}`
+            - `ghcr.io/${{ github.repository }}-relay:latest`
+
+            ### Installation
+            Download the appropriate binary for your platform from the assets below.
+
+            ### Usage
+            ```bash
+            # Install linkerdev-relay in your cluster
+            sudo linkerdev install
+            # Install DNS resolver (macOS only)
+            sudo linkerdev install-dns
+            
+            # Run your service with linkerdev
+            linkerdev -svc my-service.namespace -p 8080 go run main.go
+            ```
+
+            ### Changes
+            See the [changelog](https://github.com/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.sha }}) for details.
+          files: |
+            bin/linkerdev
+          draft: false
+          prerelease: false
