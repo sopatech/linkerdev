@@ -33,7 +33,7 @@ jobs:
       - name: Run tests
         run: |
           # Test CLI
-          cd cmd/linkerdev && go test ./...dev
+          cd cmd/linkerdev && go test ./...
           # Test relay
           cd ../relay && go test ./...
 
