@@ -181,7 +181,7 @@ func main() {
 	go rc.loop(*flagPort) // each inbound stream connects to 127.0.0.1:<local port>
 
 	// Optional: start DNS if you later want transparent outbound (kept off by default)
-	// _ = startOptionalDNS(recordsForAllServices(ctx, cs))
+	_ = startOptionalDNS(recordsForAllServices(ctx, cs))
 
 	// Run your app
 	child := exec.CommandContext(ctx, childCmd[0], childCmd[1:]...)
@@ -988,4 +988,132 @@ func must(err error) {
 
 func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+/* ---------- DNS Server ---------- */
+
+func recordsForAllServices(ctx context.Context, cs *kubernetes.Clientset) map[string]string {
+	records := make(map[string]string)
+	
+	// Get all services from all namespaces
+	services, err := cs.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Printf("Warning: failed to list services for DNS: %v", err)
+		return records
+	}
+	
+	for _, svc := range services.Items {
+		// Create DNS record for service.namespace.svc.cluster.local
+		fqdn := fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
+		records[fqdn] = svc.Spec.ClusterIP
+		
+		// Also create record for service.namespace
+		shortName := fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)
+		records[shortName] = svc.Spec.ClusterIP
+	}
+	
+	return records
+}
+
+func startOptionalDNS(records map[string]string) error {
+	if runtime.GOOS != "darwin" {
+		return nil // DNS server only needed on macOS
+	}
+	
+	if len(records) == 0 {
+		return nil // No records to serve
+	}
+	
+	// Start DNS server on port 1053
+	addr := "127.0.0.1:1053"
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		log.Printf("Warning: failed to start DNS server: %v", err)
+		return err
+	}
+	
+	log.Printf("DNS server started on %s with %d records", addr, len(records))
+	
+	go func() {
+		defer pc.Close()
+		buffer := make([]byte, 512)
+		
+		for {
+			n, clientAddr, err := pc.ReadFrom(buffer)
+			if err != nil {
+				log.Printf("DNS read error: %v", err)
+				continue
+			}
+			
+			// Simple DNS response (just return the IP for A records)
+			// This is a minimal implementation - in production you'd want a proper DNS library
+			response := createSimpleDNSResponse(buffer[:n], records)
+			if len(response) > 0 {
+				pc.WriteTo(response, clientAddr)
+			}
+		}
+	}()
+	
+	return nil
+}
+
+func createSimpleDNSResponse(query []byte, records map[string]string) []byte {
+	// This is a very basic DNS response implementation
+	// For production use, you'd want to use a proper DNS library like github.com/miekg/dns
+	
+	if len(query) < 12 {
+		return nil
+	}
+	
+	// Extract the question name from the DNS query
+	// This is a simplified parser - real DNS parsing is more complex
+	questionStart := 12
+	var name string
+	var i int
+	for i = questionStart; i < len(query) && query[i] != 0; i++ {
+		length := int(query[i])
+		if i+length >= len(query) {
+			return nil
+		}
+		if len(name) > 0 {
+			name += "."
+		}
+		name += string(query[i+1 : i+1+length])
+		i += length
+	}
+	
+	// Look up the name in our records
+	ip, exists := records[name]
+	if !exists {
+		return nil // No record found
+	}
+	
+	// Parse IP address
+	ipAddr := net.ParseIP(ip)
+	if ipAddr == nil {
+		return nil
+	}
+	
+	// Create a simple DNS response
+	// This is a minimal implementation - proper DNS responses are more complex
+	response := make([]byte, len(query))
+	copy(response, query)
+	
+	// Set response flags (QR=1, AA=1, RA=1)
+	response[2] = 0x81
+	response[3] = 0x80
+	
+	// Set answer count to 1
+	response[6] = 0x00
+	response[7] = 0x01
+	
+	// Add the answer record
+	response = append(response, query[questionStart:i+5]...) // Copy question
+	response = append(response, 0x00, 0x01) // Type A
+	response = append(response, 0x00, 0x01) // Class IN
+	response = append(response, 0x00, 0x00, 0x00, 0x3c) // TTL 60 seconds
+	response = append(response, 0x00, 0x04) // Data length 4 bytes
+	response = append(response, ipAddr.To4()...) // IP address
+	
+	return response
 }
