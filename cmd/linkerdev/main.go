@@ -1,10 +1,14 @@
 // linkerdev.go — Telepresence-lite via in-cluster relay (Docker-driver friendly)
 // Build: go build -o linkerdev .
 // Usage: linkerdev -svc <name.ns> -p <local-port> <your app cmd> [args...]
-// Extras:
+// Commands:
+//   linkerdev install         (install relay component in cluster)
+//   linkerdev uninstall       (remove relay component from cluster)
 //   linkerdev install-dns     (macOS only; one-time /etc/resolver setup)
 //   linkerdev uninstall-dns   (macOS only; remove resolver file)
 //   linkerdev clean           (best-effort sweep of leftover resources)
+//   linkerdev version         (show version information)
+//   linkerdev help            (show help message)
 
 package main
 
@@ -73,9 +77,15 @@ var relayImg = "ghcr.io/sopatech/linkerdev-relay:" + version
 /* ---------- main ---------- */
 
 func main() {
-	// Subcommands: DNS resolver (mac) + cleanup + version
+	// Subcommands: relay install/uninstall + DNS resolver (mac) + cleanup + version + help
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "install":
+			installRelay()
+			return
+		case "uninstall":
+			uninstallRelay()
+			return
 		case "install-dns":
 			installDNSResolver()
 			return
@@ -86,7 +96,10 @@ func main() {
 			cleanupResources()
 			return
 		case "version":
-			fmt.Printf("linkerdev version %s\n", version)
+			fmt.Println(version)
+			return
+		case "help":
+			showHelp()
 			return
 		}
 	}
@@ -103,7 +116,8 @@ func main() {
 	}
 	childCmd := flag.Args()
 	if *flagSvc == "" || *flagPort == 0 || len(childCmd) == 0 {
-		log.Fatalf("usage: linkerdev -svc name.ns -p <port> <your command> [args...]\n       linkerdev install-dns | uninstall-dns | clean | version")
+		showHelp()
+		os.Exit(1)
 	}
 
 	// macOS: the DNS resolver is only needed if you later enable transparent outbound;
@@ -346,6 +360,109 @@ func readFrame(r *bufio.Reader) (*frame, error) {
 		}
 	}
 	return &frame{typ: typ, streamID: id, payload: payload}, nil
+}
+
+/* ---------- Help command ---------- */
+
+func showHelp() {
+	fmt.Println("linkerdev - Telepresence-lite via in-cluster relay")
+	fmt.Println()
+	fmt.Println("USAGE:")
+	fmt.Println("  linkerdev -svc <service.namespace> -p <port> <command> [args...]")
+	fmt.Println()
+	fmt.Println("COMMANDS:")
+	fmt.Println("  install         Install relay component in cluster")
+	fmt.Println("  uninstall       Remove relay component from cluster")
+	fmt.Println("  install-dns     Install DNS resolver (macOS only)")
+	fmt.Println("  uninstall-dns   Remove DNS resolver (macOS only)")
+	fmt.Println("  clean           Clean up leftover resources")
+	fmt.Println("  version         Show version information")
+	fmt.Println("  help            Show this help message")
+	fmt.Println()
+	fmt.Println("EXAMPLES:")
+	fmt.Println("  # Install the relay component")
+	fmt.Println("  sudo linkerdev install")
+	fmt.Println()
+	fmt.Println("  # Install DNS resolver (macOS only)")
+	fmt.Println("  sudo linkerdev install-dns")
+	fmt.Println()
+	fmt.Println("  # Run your service with linkerdev")
+	fmt.Println("  linkerdev -svc api-service.apps -p 8080 go run main.go")
+	fmt.Println("  linkerdev -svc web-service.apps -p 3000 npm start")
+	fmt.Println()
+	fmt.Println("  # Clean up resources")
+	fmt.Println("  linkerdev clean")
+}
+
+/* ---------- Relay install/uninstall ---------- */
+
+func installRelay() {
+	log.Println("🚀 Installing linkerdev relay component...")
+	cfg := loadKubeConfigOrDie()
+	cs := kubernetes.NewForConfigOrDie(cfg)
+	ctx := context.Background()
+
+	// Use kube-system namespace for the relay
+	ns := "kube-system"
+
+	// Create a simple lease for ownership
+	lease, err := ensureLease(ctx, cs, ns, "linkerdev-relay-lease", "linkerdev-install")
+	if err != nil {
+		log.Printf("❌ Failed to create lease: %v", err)
+		return
+	}
+
+	// Install the relay with a default port
+	remotePort := int32(20000)
+	instance := "install"
+
+	_, err = ensureRelay(ctx, cs, ns, remotePort, lease, instance)
+	if err != nil {
+		log.Printf("❌ Failed to install relay: %v", err)
+		return
+	}
+
+	log.Println("✅ linkerdev relay component installed successfully")
+	log.Println("   The relay is now running in the kube-system namespace")
+}
+
+func uninstallRelay() {
+	log.Println("🗑️  Uninstalling linkerdev relay component...")
+	cfg := loadKubeConfigOrDie()
+	cs := kubernetes.NewForConfigOrDie(cfg)
+	ctx := context.Background()
+
+	// Use kube-system namespace
+	ns := "kube-system"
+
+	// Delete the relay deployment
+	if err := cs.AppsV1().Deployments(ns).Delete(ctx, relayName, metav1.DeleteOptions{}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("❌ Failed to delete deployment: %v", err)
+		}
+	} else {
+		log.Println("✅ Deleted relay deployment")
+	}
+
+	// Delete the relay service
+	if err := cs.CoreV1().Services(ns).Delete(ctx, relayName, metav1.DeleteOptions{}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("❌ Failed to delete service: %v", err)
+		}
+	} else {
+		log.Println("✅ Deleted relay service")
+	}
+
+	// Delete the lease
+	if err := cs.CoordinationV1().Leases(ns).Delete(ctx, "linkerdev-relay-lease", metav1.DeleteOptions{}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("❌ Failed to delete lease: %v", err)
+		}
+	} else {
+		log.Println("✅ Deleted relay lease")
+	}
+
+	log.Println("✅ linkerdev relay component uninstalled successfully")
 }
 
 /* ---------- macOS DNS install/uninstall ---------- */

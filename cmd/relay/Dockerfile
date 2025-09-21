@@ -13,6 +13,7 @@ ARG BINARY_PATH=${BINARY_PREFIX}-${TARGETOS}-${TARGETARCH}
 # Runtime
 FROM gcr.io/distroless/static:nonroot
 ARG BINARY_PATH
+LABEL org.opencontainers.image.source="https://github.com/sopatech/linkerdev"
 USER 65532:65532
 COPY ${BINARY_PATH} /linkerdev-relay
 EXPOSE 18080 20000
