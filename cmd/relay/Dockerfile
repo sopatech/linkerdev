@@ -1,16 +1,11 @@
 # syntax=docker/dockerfile:1
 
-# Build
-FROM golang:1.25.1-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/linkerdev-relay .
+# Accept the pre-built binary path as build argument
+ARG BINARY_PATH=bin/linkerdev-relay-linux-amd64
 
 # Runtime
 FROM gcr.io/distroless/static:nonroot
 USER 65532:65532
-COPY --from=build /out/linkerdev-relay /linkerdev-relay
+COPY ${BINARY_PATH} /linkerdev-relay
 EXPOSE 18080 20000
 ENTRYPOINT ["/linkerdev-relay"]
