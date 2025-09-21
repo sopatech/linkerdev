@@ -68,14 +68,13 @@ jobs:
       - name: Build and push relay image
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-          cd cmd/relay
-          docker build -t ${{ env.DOCKER_IMAGE }}:$VERSION .
+          docker build -f cmd/relay/Dockerfile -t ${{ env.DOCKER_IMAGE }}:$VERSION .
           docker tag ${{ env.DOCKER_IMAGE }}:$VERSION ${{ env.DOCKER_IMAGE }}:latest
           docker push ${{ env.DOCKER_IMAGE }}:$VERSION
           docker push ${{ env.DOCKER_IMAGE }}:latest
           echo "Built and pushed relay images:"
-          echo "- ${{ env.DOCKER_IMAGE }}-relay:$VERSION"
-          echo "- ${{ env.DOCKER_IMAGE }}-relay:latest"
+          echo "- ${{ env.DOCKER_IMAGE }}:$VERSION"
+          echo "- ${{ env.DOCKER_IMAGE }}:latest"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1

@@ -3,9 +3,9 @@
 # Build
 FROM golang:1.22-alpine AS build
 WORKDIR /src
-COPY cmd/relay/go.mod cmd/relay/go.sum ./cmd/relay/
-WORKDIR /src/cmd/relay
-COPY cmd/relay/ .
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/linkerdev-relay .
 
 # Runtime
