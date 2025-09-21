@@ -29,7 +29,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +53,7 @@ import (
 /* ---------- Config / constants ---------- */
 
 // Version is set at build time for releases
-var version = "dev"
+var version = "v0.1.0-alpha6"
 
 const (
 	// Labels
