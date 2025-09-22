@@ -39,7 +39,7 @@ const version = "0.1.0"
 
 func main() {
 	var (
-		svcFlag = flag.String("svc", "", "Service name in format 'name.namespace'")
+		svcFlag  = flag.String("svc", "", "Service name in format 'name.namespace'")
 		portFlag = flag.Int("p", 0, "Local port to forward to")
 	)
 	flag.Parse()
@@ -74,7 +74,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create dynamic client: %v", err)
 		}
-		
+
 		// Clean up all resources
 		ctx := context.Background()
 		commands.CleanupResources(ctx, cs, dyn, "default", "")
@@ -123,7 +123,7 @@ func main() {
 	// Create lease for instance tracking
 	leaseName := svcName + "-" + instance
 	lease := mustLease(k8s.EnsureLease(ctx, cs, ns, leaseName, instance)).(*coordv1.Lease)
-	
+
 	// Start lease renewal
 	leaseStop := make(chan struct{})
 	defer close(leaseStop)
@@ -141,7 +141,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to get free port: %v", err)
 	}
-	
+
 	pfCmd, err := k8s.StartKubectlPortForward(ctx, ns, "linkerdev-relay", localRPort, int(remoteRPort))
 	if err != nil {
 		log.Fatalf("Failed to start port forward: %v", err)
