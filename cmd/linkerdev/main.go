@@ -1082,6 +1082,19 @@ func recordsForAllServices(ctx context.Context, cs *kubernetes.Clientset) map[st
 		// Also create record for service.namespace
 		shortName := fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)
 		records[shortName] = svc.Spec.ClusterIP
+
+		// Debug: log NATS service specifically
+		if svc.Name == "nats" && svc.Namespace == "nats" {
+			log.Printf("DNS: Found NATS service: %s -> %s", fqdn, svc.Spec.ClusterIP)
+		}
+	}
+
+	// Debug: log all records
+	log.Printf("DNS: Created %d records:", len(records))
+	for name, ip := range records {
+		if strings.Contains(name, "nats") || strings.Contains(name, "api") {
+			log.Printf("DNS: %s -> %s", name, ip)
+		}
 	}
 
 	return records
@@ -1096,13 +1109,7 @@ func startOptionalDNS(records map[string]string) error {
 		return nil // No records to serve
 	}
 
-	// Create DNS server
-	server := &dns.Server{
-		Addr: "127.0.0.1:1053",
-		Net:  "udp",
-	}
-
-	// Set up DNS handler
+	// Set up DNS handler first
 	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
 		m := new(dns.Msg)
 		m.SetReply(r)
@@ -1110,11 +1117,27 @@ func startOptionalDNS(records map[string]string) error {
 
 		for _, q := range r.Question {
 			if q.Qtype == dns.TypeA {
+				// Normalize the query name (remove trailing dot)
+				queryName := strings.TrimSuffix(q.Name, ".")
+				log.Printf("DNS: Query for %s (normalized: %s)", q.Name, queryName)
 				// Look up the record
-				if ip, exists := records[q.Name]; exists {
+				if ip, exists := records[queryName]; exists {
+					log.Printf("DNS: Found record %s -> %s", queryName, ip)
 					rr, err := dns.NewRR(fmt.Sprintf("%s 60 IN A %s", q.Name, ip))
 					if err == nil {
 						m.Answer = append(m.Answer, rr)
+					} else {
+						log.Printf("DNS: Error creating RR for %s: %v", q.Name, err)
+					}
+				} else {
+					log.Printf("DNS: No record found for %s (have %d total records)", q.Name, len(records))
+					// Debug: show first few record keys
+					count := 0
+					for key := range records {
+						if count < 5 {
+							log.Printf("DNS: Available record: %s", key)
+							count++
+						}
 					}
 				}
 			}
@@ -1128,6 +1151,12 @@ func startOptionalDNS(records map[string]string) error {
 		w.WriteMsg(m)
 	})
 
+	// Create DNS server after setting up handler
+	server := &dns.Server{
+		Addr: "127.0.0.1:1053",
+		Net:  "udp",
+	}
+
 	log.Printf("DNS server started on %s with %d records", server.Addr, len(records))
 
 	// Start server in goroutine
@@ -1139,4 +1168,3 @@ func startOptionalDNS(records map[string]string) error {
 
 	return nil
 }
-
