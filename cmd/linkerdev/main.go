@@ -870,7 +870,23 @@ func ensureDevEndpointSlice(ctx context.Context, cs *kubernetes.Clientset, ns, s
 
 func instanceID() string {
 	h, _ := os.Hostname()
-	return fmt.Sprintf("%s-%d", h, os.Getpid())
+	// Sanitize hostname to be a valid Kubernetes name
+	sanitized := strings.ToLower(h)
+	sanitized = strings.ReplaceAll(sanitized, ".", "-")
+	// Remove any invalid characters (keep only alphanumeric and hyphens)
+	var result strings.Builder
+	for _, c := range sanitized {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+			result.WriteRune(c)
+		}
+	}
+	sanitized = result.String()
+	// Ensure it doesn't start or end with hyphen
+	sanitized = strings.Trim(sanitized, "-")
+	if sanitized == "" {
+		sanitized = "host"
+	}
+	return fmt.Sprintf("%s-%d", sanitized, os.Getpid())
 }
 
 func ownerRefToLease(lease *coordv1.Lease) []metav1.OwnerReference {
