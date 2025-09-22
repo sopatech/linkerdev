@@ -35,7 +35,7 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
-const version = "v0.1.0-alpha16"
+const version = "v0.1.0-alpha17"
 
 func main() {
 	var (
