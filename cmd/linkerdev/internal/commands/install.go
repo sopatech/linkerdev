@@ -118,7 +118,7 @@ func InstallRelay(version string) {
 				"spec": {
 					"containers": [{
 						"name": "relay",
-						"image": "ghcr.io/sopatech/linkerdev-relay:" + version,
+						"image": "ghcr.io/sopatech/linkerdev-relay:%s",
 						"args": ["--listen", "20000", "--control", "18080"],
 						"ports": [
 							{"name": "ctrl", "containerPort": 18080, "protocol": "TCP"},
@@ -137,7 +137,7 @@ func InstallRelay(version string) {
 				}
 			}
 		}
-	}`, relayName, ns, relayName, relayName, relayName)
+	}`, relayName, ns, relayName, relayName, relayName, version)
 
 	_, err := cs.AppsV1().Deployments(ns).Patch(ctx, relayName, types.ApplyPatchType,
 		[]byte(deploymentJSON),
