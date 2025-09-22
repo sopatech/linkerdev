@@ -11,754 +11,217 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"crypto/sha1"
-	"encoding/binary"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/songgao/water"
-	appsV1 "k8s.io/api/apps/v1"
+	"github.com/sopatech/linkerdev/cmd/linkerdev/internal/child"
+	"github.com/sopatech/linkerdev/cmd/linkerdev/internal/commands"
+	"github.com/sopatech/linkerdev/cmd/linkerdev/internal/k8s"
+	"github.com/sopatech/linkerdev/cmd/linkerdev/internal/linkerd"
+	"github.com/sopatech/linkerdev/cmd/linkerdev/internal/relay"
+	"github.com/sopatech/linkerdev/cmd/linkerdev/internal/tun"
+
 	coordv1 "k8s.io/api/coordination/v1"
-	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
-	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
-/* ---------- Config / constants ---------- */
-
-// Version is set at build time for releases
-var version = "v0.1.0-alpha13"
-
-const (
-	// Labels
-	kdvLabelOwned = "app.kdvwrap/owned"
-	kdvLabelInst  = "app.kdvwrap/instance"
-
-	// Lease/cleanup
-	leaseRenewEvery = 10 * time.Second
-	leaseStaleAfter = 2 * time.Minute
-
-	// macOS resolver
-	resolverDir  = "/etc/resolver"
-	resolverFile = "/etc/resolver/svc.cluster.local"
-
-	// Relay (in-cluster)
-	relayName = "linkerdev-relay"
-	relayCtrl = 18080 // control port inside the pod
-)
-
-var relayImg = "ghcr.io/sopatech/linkerdev-relay:" + version
-
-/* ---------- main ---------- */
+const version = "0.1.0"
 
 func main() {
-	// Subcommands: relay install/uninstall + cleanup + version + help
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "install":
-			installRelay()
-			return
-		case "uninstall":
-			uninstallRelay()
-			return
-		case "clean":
-			cleanupResources()
-			return
-		case "version":
-			fmt.Println(version)
-			return
-		case "help":
-			showHelp()
-			return
-		}
-	}
-
-	flagSvc := flag.String("svc", "", "Service to divert (format: name.ns)")
-	flagPort := flag.Int("p", 0, "Local port your app listens on")
+	var (
+		svcFlag = flag.String("svc", "", "Service name in format 'name.namespace'")
+		portFlag = flag.Int("p", 0, "Local port to forward to")
+	)
 	flag.Parse()
 
-	// For simplicity, we don't support `--` separator
-	for _, a := range os.Args {
-		if a == "--" {
-			log.Fatalf("`--` is not supported. Usage: linkerdev -svc name.ns -p <port> <your command> [args...]")
-		}
-	}
-	childCmd := flag.Args()
-	if *flagSvc == "" || *flagPort == 0 || len(childCmd) == 0 {
-		showHelp()
+	args := flag.Args()
+	if len(args) == 0 {
+		commands.ShowHelp()
 		os.Exit(1)
 	}
 
-	// Parse target
-	parts := strings.Split(*flagSvc, ".")
-	if len(parts) < 2 {
-		log.Fatalf("svc must be name.ns")
-	}
-	targetSvc, targetNS := parts[0], parts[1]
+	cmd := args[0]
+	cmdArgs := args[1:]
 
-	// Validate service name and namespace
-	if targetSvc == "" || targetNS == "" {
-		log.Fatalf("service name and namespace cannot be empty")
+	switch cmd {
+	case "help":
+		commands.ShowHelp()
+		return
+	case "version":
+		fmt.Printf("linkerdev version %s\n", version)
+		return
+	case "install":
+		commands.InstallRelay()
+		return
+	case "uninstall":
+		commands.UninstallRelay()
+		return
+	case "clean":
+		// Cleanup mode - clean up resources
+		cs := k8s.NewClientset()
+		cfg := k8s.LoadKubeConfigOrDie()
+		dyn, err := dynamic.NewForConfig(cfg)
+		if err != nil {
+			log.Fatalf("Failed to create dynamic client: %v", err)
+		}
+		
+		// Clean up all resources
+		ctx := context.Background()
+		commands.CleanupResources(ctx, cs, dyn, "default", "")
+		return
 	}
-	if !isValidKubernetesName(targetSvc) || !isValidKubernetesName(targetNS) {
-		log.Fatalf("service name and namespace must be valid Kubernetes names (alphanumeric and hyphens only)")
+
+	// Main proxy mode
+	if *svcFlag == "" || *portFlag == 0 {
+		log.Fatal("Both -svc and -p flags are required for proxy mode")
 	}
-	devSvc := targetSvc + "-dev"
-	remoteRPort := int32(remotePortFor(targetSvc, targetNS)) // relay listen port in cluster
+
+	parts := strings.Split(*svcFlag, ".")
+	if len(parts) != 2 {
+		log.Fatal("Service must be in format 'name.namespace'")
+	}
+	svcName, ns := parts[0], parts[1]
+
+	if !isValidKubernetesName(svcName) || !isValidKubernetesName(ns) {
+		log.Fatal("Invalid service or namespace name")
+	}
+
+	// Generate instance ID
 	instance := instanceID()
-	leaseName := "linkerdev-" + targetSvc
+	log.Printf("Starting linkerdev for service %s in namespace %s (instance: %s)", svcName, ns, instance)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// Load Kubernetes config and create clients
+	cs := k8s.NewClientset()
+	cfg := k8s.LoadKubeConfigOrDie()
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		log.Fatalf("Failed to create dynamic client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Kube clients
-	cfg := loadKubeConfigOrDie()
-	cs := kubernetes.NewForConfigOrDie(cfg)
-	dyn := dynamic.NewForConfigOrDie(cfg)
-
-	// Preflight: sweep stale & acquire Lease
-	must(reapStale(ctx, cs, dyn, targetNS, targetSvc, leaseName))
-	lease := mustLease(ensureLease(ctx, cs, targetNS, leaseName, instance))
-	stopRenew := make(chan struct{})
-	go renewLeaseLoop(cs, targetNS, leaseName, instance, stopRenew)
-	defer close(stopRenew)
-
-	// Ensure relay (Deployment + ClusterIP Service) and get its Pod IP
-	podIP, err := ensureRelay(ctx, cs, targetNS, remoteRPort, lease, instance)
-	must(err)
-
-	// Create/refresh dev Service + EndpointSlice that points to RELAY POD IP:remoteRPort
-	must(ensureDevService(ctx, cs, targetNS, devSvc, int32(*flagPort), remoteRPort, lease, instance))
-	must(ensureDevEndpointSlice(ctx, cs, targetNS, devSvc, podIP, remoteRPort, lease, instance))
-
-	// Use Linkerd TrafficSplit to divert 100% traffic from original service to dev service
-	must(applyTrafficSplit(ctx, dyn, targetNS, targetSvc, devSvc, lease, instance))
-
-	// kubectl port-forward: forward relay control port to a free local port
-	localCtrl, err := randomFreePort()
-	must(err)
-	kpf, err := startKubectlPortForward(ctx, targetNS, relayName, localCtrl, relayCtrl)
-	must(err)
-	defer func() {
-		if kpf.Process != nil {
-			_ = kpf.Process.Kill()
-			// Give the process a moment to exit gracefully
-			done := make(chan error, 1)
-			go func() { _, err := kpf.Process.Wait(); done <- err }()
-			select {
-			case <-done:
-				// Process exited
-			case <-time.After(2 * time.Second):
-				// Force kill if it doesn't exit gracefully
-				_ = kpf.Process.Kill()
-			}
-		}
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Received signal, shutting down...")
+		cancel()
 	}()
 
-	// Open a control connection to the relay and start multiplexing cluster->local
-	rc, err := newRelayClient(fmt.Sprintf("127.0.0.1:%d", localCtrl))
-	must(err)
-	go rc.loop(*flagPort) // each inbound stream connects to 127.0.0.1:<local port>
+	// Create lease for instance tracking
+	leaseName := svcName + "-" + instance
+	lease := mustLease(k8s.EnsureLease(ctx, cs, ns, leaseName, instance)).(*coordv1.Lease)
+	
+	// Start lease renewal
+	leaseStop := make(chan struct{})
+	defer close(leaseStop)
+	go k8s.RenewLeaseLoop(cs, ns, leaseName, instance, leaseStop)
 
-	// Start transparent TUN proxy for outbound traffic hijacking
-	go startTransparentProxy(ctx, cs, rc)
-
-	// Run your app
-	child := exec.CommandContext(ctx, childCmd[0], childCmd[1:]...)
-	child.Stdout, child.Stderr, child.Stdin = os.Stdout, os.Stderr, os.Stdin
-
-	// Ensure lease cleanup happens regardless of how child exits
-	defer func() {
-		_ = cs.CoordinationV1().Leases(targetNS).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
-	}()
-
-	// Scope resolv.conf to the child (cross-platform). Safe even if unused.
-	if err := runChildWithResolv(ctx, child); err != nil {
-		log.Fatalf("child start: %v", err)
-	}
-
-	// Wait for signal
-	<-ctx.Done()
-
-	// Cleanup (Lease ownerRef GC will remove relay svc/dep, dev svc/slice)
-	_ = cs.CoordinationV1().Leases(targetNS).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
-	time.Sleep(150 * time.Millisecond)
-}
-
-/* ---------- Relay client (multiplex many in-cluster streams over one control TCP) ---------- */
-
-type relayClient struct {
-	conn    net.Conn
-	br      *bufio.Reader
-	bw      *bufio.Writer
-	writeMu sync.Mutex
-	streams sync.Map // streamID -> net.Conn (local app connection)
-}
-
-const (
-	tOpen            = 0x01
-	tData            = 0x02
-	tClose           = 0x03
-	tRst             = 0x04
-	tOutboundConnect = 0x05
-	tPing            = 0x10
-	tPong            = 0x11
-)
-
-func newRelayClient(addr string) (*relayClient, error) {
-	c, err := net.Dial("tcp", addr)
+	// Ensure relay is running
+	remoteRPort := int32(remotePortFor(svcName, ns))
+	_, err = k8s.EnsureRelay(ctx, cs, ns, remoteRPort, lease, instance)
 	if err != nil {
-		return nil, err
+		log.Fatalf("Failed to ensure relay: %v", err)
 	}
-	rc := &relayClient{
-		conn: c,
-		br:   bufio.NewReader(c),
-		bw:   bufio.NewWriterSize(c, 64<<10),
-	}
-	_ = rc.sendFrame(tPing, 0, []byte("HELLO LINKERDEV"))
-	return rc, nil
-}
 
-func (rc *relayClient) loop(localAppPort int) {
-	defer rc.conn.Close()
-	for {
-		fr, err := readFrame(rc.br)
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Printf("[relay] control read error: %v", err)
-			}
-			return
-		}
-		switch fr.typ {
-		case tOpen:
-			app, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localAppPort))
-			if err != nil {
-				_ = rc.sendFrame(tRst, fr.streamID, nil)
-				continue
-			}
-			rc.streams.Store(fr.streamID, app)
-			// pump app -> relay as DATA frames
-			go func(id uint32, a net.Conn) {
-				defer func() {
-					_ = a.Close()
-					rc.streams.Delete(id)
-				}()
-				buf := make([]byte, 64<<10)
-				for {
-					n, err := a.Read(buf)
-					if n > 0 {
-						if err := rc.sendFrame(tData, id, buf[:n]); err != nil {
-							return
-						}
-					}
-					if err != nil {
-						if err == io.EOF {
-							_ = rc.sendFrame(tClose, id, nil)
-						} else {
-							_ = rc.sendFrame(tRst, id, nil)
-						}
-						return
-					}
-				}
-			}(fr.streamID, app)
-
-		case tData:
-			if v, ok := rc.streams.Load(fr.streamID); ok {
-				a := v.(net.Conn)
-				if _, err := a.Write(fr.payload); err != nil {
-					_ = rc.sendFrame(tRst, fr.streamID, nil)
-					_ = a.Close()
-					rc.streams.Delete(fr.streamID)
-				}
-			} else {
-				_ = rc.sendFrame(tRst, fr.streamID, nil)
-			}
-
-		case tClose:
-			if v, ok := rc.streams.Load(fr.streamID); ok {
-				if tcp, ok2 := v.(net.Conn).(*net.TCPConn); ok2 {
-					_ = tcp.CloseWrite()
-				}
-			}
-
-		case tRst:
-			if v, ok := rc.streams.LoadAndDelete(fr.streamID); ok {
-				_ = v.(net.Conn).Close()
-			}
-
-		case tPing:
-			_ = rc.sendFrame(tPong, 0, fr.payload)
-		}
-	}
-}
-
-func (rc *relayClient) sendFrame(typ byte, id uint32, payload []byte) error {
-	rc.writeMu.Lock()
-	defer rc.writeMu.Unlock()
-	var hdr [9]byte
-	hdr[0] = typ
-	binary.BigEndian.PutUint32(hdr[1:5], id)
-	if payload == nil {
-		binary.BigEndian.PutUint32(hdr[5:9], 0)
-		if _, err := rc.bw.Write(hdr[:]); err != nil {
-			return err
-		}
-		return rc.bw.Flush()
-	}
-	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload)))
-	if _, err := rc.bw.Write(hdr[:]); err != nil {
-		return err
-	}
-	if _, err := rc.bw.Write(payload); err != nil {
-		return err
-	}
-	return rc.bw.Flush()
-}
-
-func (rc *relayClient) sendOutboundConnect(destination string) error {
-	// Generate a unique stream ID for this outbound connection
-	streamID := uint32(time.Now().UnixNano() & 0xFFFFFFFF)
-
-	// Send the outbound connect frame
-	return rc.sendFrame(tOutboundConnect, streamID, []byte(destination))
-}
-
-type frame struct {
-	typ      byte
-	streamID uint32
-	payload  []byte
-}
-
-func readFrame(r *bufio.Reader) (*frame, error) {
-	var hdr [9]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	typ := hdr[0]
-	id := binary.BigEndian.Uint32(hdr[1:5])
-	l := binary.BigEndian.Uint32(hdr[5:9])
-	var payload []byte
-	if l > 0 {
-		payload = make([]byte, l)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil, err
-		}
-	}
-	return &frame{typ: typ, streamID: id, payload: payload}, nil
-}
-
-/* ---------- Help command ---------- */
-
-func showHelp() {
-	fmt.Println("linkerdev - Telepresence-lite via in-cluster relay")
-	fmt.Println()
-	fmt.Println("USAGE:")
-	fmt.Println("  linkerdev -svc <service.namespace> -p <port> <command> [args...]")
-	fmt.Println()
-	fmt.Println("COMMANDS:")
-	fmt.Println("  install         Install relay component in cluster")
-	fmt.Println("  uninstall       Remove relay component from cluster")
-	fmt.Println("  clean           Clean up leftover resources")
-	fmt.Println("  version         Show version information")
-	fmt.Println("  help            Show this help message")
-	fmt.Println()
-	fmt.Println("EXAMPLES:")
-	fmt.Println("  # Install the relay component")
-	fmt.Println("  sudo linkerdev install")
-	fmt.Println()
-	fmt.Println()
-	fmt.Println("  # Run your service with linkerdev")
-	fmt.Println("  linkerdev -svc api-service.apps -p 8080 go run main.go")
-	fmt.Println("  linkerdev -svc web-service.apps -p 3000 npm start")
-	fmt.Println()
-	fmt.Println("  # Clean up resources")
-	fmt.Println("  linkerdev clean")
-}
-
-/* ---------- Relay install/uninstall ---------- */
-
-func installRelay() {
-	log.Println("🚀 Installing linkerdev relay component...")
-	cfg := loadKubeConfigOrDie()
-	cs := kubernetes.NewForConfigOrDie(cfg)
-	ctx := context.Background()
-
-	// Use kube-system namespace for the relay
-	ns := "kube-system"
-
-	// Create a simple lease for ownership
-	lease, err := ensureLease(ctx, cs, ns, "linkerdev-relay-lease", "linkerdev-install")
+	// Start port forward to relay
+	localRPort, err := randomFreePort()
 	if err != nil {
-		log.Printf("❌ Failed to create lease: %v", err)
-		return
+		log.Fatalf("Failed to get free port: %v", err)
 	}
-
-	// Install the relay with a default port
-	remotePort := int32(20000)
-	instance := "install"
-
-	_, err = ensureRelay(ctx, cs, ns, remotePort, lease, instance)
+	
+	pfCmd, err := k8s.StartKubectlPortForward(ctx, ns, "linkerdev-relay", localRPort, int(remoteRPort))
 	if err != nil {
-		log.Printf("❌ Failed to install relay: %v", err)
-		return
+		log.Fatalf("Failed to start port forward: %v", err)
 	}
+	defer pfCmd.Process.Kill()
 
-	log.Println("✅ linkerdev relay component installed successfully")
-	log.Println("   The relay is now running in the kube-system namespace")
-}
+	// Wait for port forward to be ready
+	time.Sleep(2 * time.Second)
 
-func uninstallRelay() {
-	log.Println("🗑️  Uninstalling linkerdev relay component...")
-	cfg := loadKubeConfigOrDie()
-	cs := kubernetes.NewForConfigOrDie(cfg)
-	ctx := context.Background()
-
-	// Use kube-system namespace
-	ns := "kube-system"
-
-	// Delete the relay deployment
-	if err := cs.AppsV1().Deployments(ns).Delete(ctx, relayName, metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.Printf("❌ Failed to delete deployment: %v", err)
-		}
-	} else {
-		log.Println("✅ Deleted relay deployment")
-	}
-
-	// Delete the relay service
-	if err := cs.CoreV1().Services(ns).Delete(ctx, relayName, metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.Printf("❌ Failed to delete service: %v", err)
-		}
-	} else {
-		log.Println("✅ Deleted relay service")
-	}
-
-	// Delete the lease
-	if err := cs.CoordinationV1().Leases(ns).Delete(ctx, "linkerdev-relay-lease", metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.Printf("❌ Failed to delete lease: %v", err)
-		}
-	} else {
-		log.Println("✅ Deleted relay lease")
-	}
-
-	log.Println("✅ linkerdev relay component uninstalled successfully")
-}
-
-/* ---------- Cleanup command ---------- */
-
-func cleanupResources() {
-	log.Println("🧹 Cleaning up linkerdev resources...")
-	cfg := loadKubeConfigOrDie()
-	cs := kubernetes.NewForConfigOrDie(cfg)
-	dyn := dynamic.NewForConfigOrDie(cfg)
-
-	namespaces, err := cs.CoreV1().Namespaces().List(context.Background(), metav1.ListOptions{})
+	// Connect to relay
+	rc, err := relay.NewRelayClient(fmt.Sprintf("127.0.0.1:%d", localRPort))
 	if err != nil {
-		log.Printf("❌ list namespaces: %v", err)
-		return
+		log.Fatalf("Failed to connect to relay: %v", err)
 	}
+	defer rc.Close()
 
-	cleaned := 0
-	for _, ns := range namespaces.Items {
-		nsName := ns.Name
-		sel := metav1.ListOptions{LabelSelector: kdvLabelOwned + "=true"}
-
-		_ = cs.AppsV1().Deployments(nsName).Delete(context.Background(), relayName, metav1.DeleteOptions{})
-		_ = cs.CoreV1().Services(nsName).Delete(context.Background(), relayName, metav1.DeleteOptions{})
-
-		if svcs, err := cs.CoreV1().Services(nsName).List(context.Background(), sel); err == nil {
-			for _, s := range svcs.Items {
-				if strings.HasSuffix(s.Name, "-dev") {
-					_ = cs.CoreV1().Services(nsName).Delete(context.Background(), s.Name, metav1.DeleteOptions{})
-					cleaned++
-				}
-			}
-		}
-		if es, err := cs.DiscoveryV1().EndpointSlices(nsName).List(context.Background(), sel); err == nil {
-			for _, e := range es.Items {
-				_ = cs.DiscoveryV1().EndpointSlices(nsName).Delete(context.Background(), e.Name, metav1.DeleteOptions{})
-				cleaned++
-			}
-		}
-		_ = deleteTrafficSplit(context.Background(), dyn, nsName, nsName+"-split") // best-effort; names may differ
-	}
-	log.Printf("✅ Cleanup completed (approx %d items)", cleaned)
-}
-
-/* ---------- Linkerd: TrafficSplit (universal TCP traffic diversion) ---------- */
-
-func applyTrafficSplit(ctx context.Context, dyn dynamic.Interface, ns, svc, devSvc string, lease *coordv1.Lease, instance string) error {
-	// TrafficSplit uses SMI specification
-	gvr := schema.GroupVersionResource{
-		Group:    "split.smi-spec.io",
-		Version:  "v1alpha2",
-		Resource: "trafficsplits",
-	}
-
-	name := svc + "-split"
-	obj := map[string]any{
-		"apiVersion": "split.smi-spec.io/v1alpha2",
-		"kind":       "TrafficSplit",
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": ns,
-			"labels":    map[string]string{kdvLabelOwned: "true", kdvLabelInst: instance},
-			"ownerReferences": []map[string]any{{
-				"apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
-				"name": lease.Name, "uid": string(lease.UID),
-				"controller": true, "blockOwnerDeletion": true,
-			}},
-		},
-		"spec": map[string]any{
-			"service": svc, // Original service name
-			"backends": []map[string]any{
-				{
-					"service": devSvc, // Dev service gets 100% traffic
-					"weight":  100,
-				},
-				{
-					"service": svc, // Original service gets 0% traffic
-					"weight":  0,
-				},
-			},
-		},
-	}
-
-	b, _ := json.Marshal(obj)
-	log.Printf("TrafficSplit: Creating traffic split %s to route 100%% traffic from %s to %s", name, svc, devSvc)
-
-	if result, err := dyn.Resource(gvr).Namespace(ns).Patch(ctx, name, types.ApplyPatchType, b, metav1.PatchOptions{FieldManager: "linkerdev"}); err == nil {
-		log.Printf("TrafficSplit: Successfully created traffic split %s, result: %v", name, result)
-		return nil
-	} else {
-		log.Printf("TrafficSplit: Failed to create traffic split %s: %v", name, err)
-		return err
-	}
-}
-
-func deleteTrafficSplit(ctx context.Context, dyn dynamic.Interface, ns, name string) error {
-	gvr := schema.GroupVersionResource{
-		Group:    "split.smi-spec.io",
-		Version:  "v1alpha2",
-		Resource: "trafficsplits",
-	}
-
-	log.Printf("TrafficSplit: Deleting traffic split %s", name)
-	return dyn.Resource(gvr).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})
-}
-
-/* ---------- In-cluster relay Deployment + Service + kubectl port-forward ---------- */
-
-func ensureRelay(ctx context.Context, cs *kubernetes.Clientset, ns string, remoteRPort int32, lease *coordv1.Lease, instance string) (string, error) {
-	labels := map[string]string{"app": relayName, kdvLabelOwned: "true", kdvLabelInst: instance}
-	// Deployment
-	replicas := int32(1)
-	dep := &appsV1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: relayName, Namespace: ns, Labels: labels, OwnerReferences: ownerRefToLease(lease)},
-		Spec: appsV1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{MatchLabels: labels},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{
-						Name:  "relay",
-						Image: relayImg,
-						Args:  []string{"--listen", strconv.Itoa(int(remoteRPort)), "--control", strconv.Itoa(relayCtrl)},
-						Ports: []corev1.ContainerPort{
-							{Name: "ctrl", ContainerPort: int32(relayCtrl)},
-							{Name: "rev", ContainerPort: remoteRPort},
-						},
-						ReadinessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstrutil.FromInt(relayCtrl)},
-							},
-							InitialDelaySeconds: 1, PeriodSeconds: 2,
-						},
-					}},
-				},
-			},
-		},
-	}
-	dc := cs.AppsV1().Deployments(ns)
-	if _, err := dc.Get(ctx, relayName, metav1.GetOptions{}); apierrors.IsNotFound(err) {
-		if _, err := dc.Create(ctx, dep, metav1.CreateOptions{}); err != nil {
-			return "", err
-		}
-	} else if err == nil {
-		if _, err := dc.Update(ctx, dep, metav1.UpdateOptions{}); err != nil {
-			return "", err
-		}
-	} else {
-		return "", err
-	}
-
-	// Service
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: relayName, Namespace: ns, Labels: labels, OwnerReferences: ownerRefToLease(lease)},
-		Spec: corev1.ServiceSpec{
-			Selector: labels,
-			Ports: []corev1.ServicePort{
-				{Name: "ctrl", Port: int32(relayCtrl), TargetPort: intstrutil.FromInt(relayCtrl), Protocol: corev1.ProtocolTCP},
-				{Name: "rev", Port: remoteRPort, TargetPort: intstrutil.FromInt(int(remoteRPort)), Protocol: corev1.ProtocolTCP},
-			},
-		},
-	}
-	sc := cs.CoreV1().Services(ns)
-	if _, err := sc.Get(ctx, relayName, metav1.GetOptions{}); apierrors.IsNotFound(err) {
-		if _, err := sc.Create(ctx, svc, metav1.CreateOptions{}); err != nil {
-			return "", err
-		}
-	} else if err == nil {
-		if _, err := sc.Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
-			return "", err
-		}
-	} else {
-		return "", err
-	}
-
-	// Wait for relay Pod IP
-	return waitForPodIP(ctx, cs, ns, "app="+relayName+","+kdvLabelInst+"="+instance, 60*time.Second)
-}
-
-func startKubectlPortForward(ctx context.Context, ns, name string, local, remote int) (*exec.Cmd, error) {
-	cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "port-forward", "svc/"+name, fmt.Sprintf("%d:%d", local, remote))
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	time.Sleep(700 * time.Millisecond) // settle
-	return cmd, nil
-}
-
-func waitForPodIP(ctx context.Context, cs *kubernetes.Clientset, ns, selector string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("context cancelled while waiting for relay pod IP: %v", ctx.Err())
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				return "", fmt.Errorf("timed out waiting for relay pod IP")
-			}
-			pods, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
-			if err == nil {
-				for _, p := range pods.Items {
-					if p.Status.PodIP != "" {
-						return p.Status.PodIP, nil
-					}
-				}
-			}
-		}
-	}
-}
-
-/* ---------- K8s: dev Service/EndpointSlice + Lease ---------- */
-
-func loadKubeConfigOrDie() *rest.Config {
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return cfg
-	}
-	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		clientcmd.NewDefaultClientConfigLoadingRules(),
-		&clientcmd.ConfigOverrides{},
-	).ClientConfig()
+	// Create dev service and endpoint slice
+	devSvcName := svcName + "-dev"
+	err = k8s.EnsureDevService(ctx, cs, ns, svcName, 80, remoteRPort, lease, instance)
 	if err != nil {
-		log.Fatalf("kubeconfig: %v", err)
+		log.Fatalf("Failed to create dev service: %v", err)
 	}
-	return cfg
+
+	// Get relay pod IP for endpoint slice
+	relayIP, err := k8s.WaitForPodIP(ctx, cs, ns, "app=linkerdev-relay", 30*time.Second)
+	if err != nil {
+		log.Fatalf("Failed to get relay pod IP: %v", err)
+	}
+
+	err = k8s.EnsureDevEndpointSlice(ctx, cs, ns, svcName, relayIP, remoteRPort, lease, instance)
+	if err != nil {
+		log.Fatalf("Failed to create endpoint slice: %v", err)
+	}
+
+	// Create TrafficSplit to route 100% traffic to dev service
+	err = linkerd.ApplyTrafficSplit(ctx, dyn, ns, svcName, devSvcName, lease, instance)
+	if err != nil {
+		log.Fatalf("Failed to create TrafficSplit: %v", err)
+	}
+
+	// Start TUN interface for transparent proxying
+	go tun.StartTransparentProxy(ctx, cs, rc)
+
+	// Start relay client loop
+	go rc.Loop(*portFlag)
+
+	// Start child process
+	childCmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+	childCmd.Stdin = os.Stdin
+	childCmd.Stdout = os.Stdout
+	childCmd.Stderr = os.Stderr
+
+	// Run child with custom resolv.conf
+	err = child.RunChildWithResolv(ctx, childCmd)
+	if err != nil {
+		log.Printf("Child process exited with error: %v", err)
+	}
+
+	// Cleanup
+	log.Println("Cleaning up resources...")
+	linkerd.DeleteTrafficSplit(ctx, dyn, ns, svcName+"-split")
+	commands.CleanupResources(ctx, cs, dyn, ns, svcName)
 }
 
-func ensureDevService(ctx context.Context, cs *kubernetes.Clientset, ns, name string, svcPort, remotePort int32, lease *coordv1.Lease, instance string) error {
-	s := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: ns,
-			Labels:          map[string]string{kdvLabelOwned: "true", kdvLabelInst: instance},
-			OwnerReferences: ownerRefToLease(lease),
-		},
-		Spec: corev1.ServiceSpec{
-			Ports: []corev1.ServicePort{{
-				Name:       "http",
-				Port:       svcPort,
-				TargetPort: intstrutil.FromInt(int(remotePort)),
-				Protocol:   corev1.ProtocolTCP,
-			}},
-		},
+// Utility functions
+func isValidKubernetesName(name string) bool {
+	if len(name) == 0 || len(name) > 253 {
+		return false
 	}
-	if _, err := cs.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{}); err == nil {
-		existing, _ := cs.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
-		existing.Labels = s.Labels
-		existing.OwnerReferences = s.OwnerReferences
-		existing.Spec.Ports = s.Spec.Ports
-		_, err := cs.CoreV1().Services(ns).Update(ctx, existing, metav1.UpdateOptions{})
-		return err
+	// Kubernetes names must be lowercase alphanumeric characters and hyphens
+	// Cannot start or end with hyphen
+	if name[0] == '-' || name[len(name)-1] == '-' {
+		return false
 	}
-	_, err := cs.CoreV1().Services(ns).Create(ctx, s, metav1.CreateOptions{})
-	return err
-}
-
-func ptr[T any](v T) *T { return &v }
-
-func ensureDevEndpointSlice(ctx context.Context, cs *kubernetes.Clientset, ns, svcName, ip string, port int32, lease *coordv1.Lease, instance string) error {
-	esName := fmt.Sprintf("%s-%s", svcName, instance)
-	addrType := discoveryv1.AddressTypeIPv4
-	ready := true
-	labels := map[string]string{
-		"kubernetes.io/service-name": svcName, // associates slice to Service
-		kdvLabelOwned:                "true",
-		kdvLabelInst:                 instance,
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
 	}
-	es := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            esName,
-			Namespace:       ns,
-			Labels:          labels,
-			OwnerReferences: ownerRefToLease(lease),
-		},
-		AddressType: addrType,
-		Endpoints: []discoveryv1.Endpoint{
-			{Addresses: []string{ip}, Conditions: discoveryv1.EndpointConditions{Ready: ptr(ready)}},
-		},
-		Ports: []discoveryv1.EndpointPort{
-			{Name: ptr("http"), Protocol: ptr(corev1.ProtocolTCP), Port: ptr(port)},
-		},
-	}
-	if _, err := cs.DiscoveryV1().EndpointSlices(ns).Get(ctx, esName, metav1.GetOptions{}); err == nil {
-		_, err := cs.DiscoveryV1().EndpointSlices(ns).Update(ctx, es, metav1.UpdateOptions{})
-		return err
-	}
-	_, err := cs.DiscoveryV1().EndpointSlices(ns).Create(ctx, es, metav1.CreateOptions{})
-	return err
+	return true
 }
 
 func instanceID() string {
@@ -782,165 +245,20 @@ func instanceID() string {
 	return fmt.Sprintf("%s-%d", sanitized, os.Getpid())
 }
 
-func ownerRefToLease(lease *coordv1.Lease) []metav1.OwnerReference {
-	t := true
-	return []metav1.OwnerReference{{
-		APIVersion:         "coordination.k8s.io/v1",
-		Kind:               "Lease",
-		Name:               lease.Name,
-		UID:                lease.UID,
-		Controller:         &t,
-		BlockOwnerDeletion: &t,
-	}}
-}
-
-func ensureLease(ctx context.Context, cs *kubernetes.Clientset, ns, name, holder string) (*coordv1.Lease, error) {
-	now := metav1.MicroTime{Time: time.Now()}
-	secs := int32(int(leaseStaleAfter.Seconds()))
-	l := &coordv1.Lease{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-		Spec: coordv1.LeaseSpec{
-			HolderIdentity:       &holder,
-			AcquireTime:          &now,
-			RenewTime:            &now,
-			LeaseDurationSeconds: &secs,
-		},
-	}
-	lg := cs.CoordinationV1().Leases(ns)
-	if existing, err := lg.Get(ctx, name, metav1.GetOptions{}); err == nil {
-		existing.Spec.HolderIdentity = &holder
-		existing.Spec.RenewTime = &now
-		existing.Spec.AcquireTime = &now
-		existing.Spec.LeaseDurationSeconds = &secs
-		return lg.Update(ctx, existing, metav1.UpdateOptions{})
-	}
-	return lg.Create(ctx, l, metav1.CreateOptions{})
-}
-
-func renewLeaseLoop(cs *kubernetes.Clientset, ns, name, holder string, stop <-chan struct{}) {
-	lg := cs.CoordinationV1().Leases(ns)
-	t := time.NewTicker(leaseRenewEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			l, err := lg.Get(context.Background(), name, metav1.GetOptions{})
-			if err != nil {
-				continue
-			}
-			now := metav1.MicroTime{Time: time.Now()}
-			l.Spec.RenewTime = &now
-			l.Spec.HolderIdentity = &holder
-			_, _ = lg.Update(context.Background(), l, metav1.UpdateOptions{})
-		case <-stop:
-			return
-		}
-	}
-}
-
-func reapStale(ctx context.Context, cs *kubernetes.Clientset, dyn dynamic.Interface, ns, svc, leaseName string) error {
-	lg := cs.CoordinationV1().Leases(ns)
-	lease, err := lg.Get(ctx, leaseName, metav1.GetOptions{})
-	if err == nil {
-		if isLeaseStale(lease) {
-			log.Printf("[linkerdev] stale lease %s/%s — sweeping", ns, leaseName)
-			_ = lg.Delete(ctx, leaseName, metav1.DeleteOptions{})
-
-			sel := metav1.ListOptions{LabelSelector: kdvLabelOwned + "=true"}
-			_ = cs.AppsV1().Deployments(ns).Delete(ctx, relayName, metav1.DeleteOptions{})
-			_ = cs.CoreV1().Services(ns).Delete(ctx, relayName, metav1.DeleteOptions{})
-
-			if svcs, err := cs.CoreV1().Services(ns).List(ctx, sel); err == nil {
-				for _, s := range svcs.Items {
-					_ = cs.CoreV1().Services(ns).Delete(ctx, s.Name, metav1.DeleteOptions{})
-				}
-			}
-			if es, err := cs.DiscoveryV1().EndpointSlices(ns).List(ctx, sel); err == nil {
-				for _, e := range es.Items {
-					_ = cs.DiscoveryV1().EndpointSlices(ns).Delete(ctx, e.Name, metav1.DeleteOptions{})
-				}
-			}
-			_ = deleteTrafficSplit(ctx, dyn, ns, svc+"-split")
-		} else {
-			return fmt.Errorf("another linkerdev instance appears active (lease fresh)")
-		}
-	}
-	return nil
-}
-
-func isLeaseStale(l *coordv1.Lease) bool {
-	if l.Spec.RenewTime != nil {
-		return time.Since(l.Spec.RenewTime.Time) > leaseStaleAfter
-	}
-	if l.Spec.AcquireTime != nil {
-		return time.Since(l.Spec.AcquireTime.Time) > leaseStaleAfter
-	}
-	return true
-}
-
-// mustLease is like must() but returns the lease value on success.
-func mustLease(l *coordv1.Lease, err error) *coordv1.Lease {
+func mustLease(l interface{}, err error) interface{} {
 	if err != nil {
 		log.Fatal(err)
 	}
 	return l
 }
 
-/* ---------- Linux child with private resolv.conf (safe no-op today) ---------- */
-
-func runChildWithResolv(ctx context.Context, child *exec.Cmd) error {
-	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("linkerdev-%d", os.Getpid()))
-	_ = os.MkdirAll(tmp, 0o700)
-	resolv := filepath.Join(tmp, "resolv.conf")
-	content := "nameserver 127.0.0.1\noptions timeout:1 attempts:1 ndots:5\n"
-	if err := os.WriteFile(resolv, []byte(content), 0o644); err != nil {
-		return err
-	}
-
-	switch runtime.GOOS {
-	case "linux":
-		return runChildWithResolvLinux(ctx, child, resolv)
-	case "darwin":
-		return runChildWithResolvDarwin(ctx, child, resolv)
-	default:
-		// Fallback: just run the child without DNS scoping
-		return child.Run()
-	}
-}
-
-func runChildWithResolvLinux(ctx context.Context, child *exec.Cmd, resolv string) error {
-	args := []string{
-		"--mount", "--uts", "--ipc",
-		"--propagation", "private",
-		"/bin/sh", "-lc",
-		fmt.Sprintf("mount --make-rprivate / && mount -o bind %s /etc/resolv.conf && exec \"$@\"", shQuote(resolv)),
-		"sh", "-lc", strings.Join(append([]string{child.Path}, child.Args[1:]...), " "),
-	}
-	cmd := exec.CommandContext(ctx, "unshare", args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
-}
-
-func runChildWithResolvDarwin(ctx context.Context, child *exec.Cmd, resolv string) error {
-	// On macOS, we can use dscacheutil to temporarily override DNS
-	// This is a simpler approach than trying to mount over /etc/resolv.conf
-	child.Env = append(child.Env, "LINKERDEV_RESOLV_CONF="+resolv)
-
-	// Start the child process
-	if err := child.Start(); err != nil {
-		return err
-	}
-
-	// Wait for it to complete
-	return child.Wait()
-}
-
-/* ---------- misc ---------- */
-
 func remotePortFor(svc, ns string) int {
-	h := sha1.Sum([]byte(ns + "/" + svc))
-	n := binary.BigEndian.Uint16(h[:2])
-	return 20000 + int(n%10000) // 20000..29999
+	// Simple hash-based port generation
+	h := 0
+	for _, c := range ns + "/" + svc {
+		h = h*31 + int(c)
+	}
+	return 20000 + (h % 10000) // 20000..29999
 }
 
 func randomFreePort() (int, error) {
@@ -951,224 +269,4 @@ func randomFreePort() (int, error) {
 	defer l.Close()
 	_, pStr, _ := net.SplitHostPort(l.Addr().String())
 	return strconv.Atoi(pStr)
-}
-
-func must(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func shQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-func isValidKubernetesName(name string) bool {
-	if len(name) == 0 || len(name) > 253 {
-		return false
-	}
-	// Kubernetes names must be lowercase alphanumeric characters and hyphens
-	// Cannot start or end with hyphen
-	if name[0] == '-' || name[len(name)-1] == '-' {
-		return false
-	}
-	for _, c := range name {
-		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
-			return false
-		}
-	}
-	return true
-}
-
-func startTransparentProxy(ctx context.Context, cs *kubernetes.Clientset, rc *relayClient) {
-	// Create TUN interface
-	config := water.Config{
-		DeviceType: water.TUN,
-	}
-	config.Name = "utun0"
-
-	iface, err := water.New(config)
-	if err != nil {
-		log.Printf("Failed to create TUN interface: %v", err)
-		return
-	}
-	defer iface.Close()
-
-	log.Printf("Created TUN interface: %s", iface.Name())
-
-	// Set up routing (this requires root privileges)
-	if err := setupRouting(iface.Name()); err != nil {
-		log.Printf("Failed to setup routing: %v", err)
-		return
-	}
-
-	// Start packet processing
-	go processPackets(ctx, iface, rc)
-
-	// Wait for context cancellation
-	<-ctx.Done()
-
-	// Cleanup routing
-	cleanupRouting(iface.Name())
-}
-
-func setupRouting(ifaceName string) error {
-	log.Printf("Setting up routing for TUN interface: %s", ifaceName)
-
-	// Check if we're running as root
-	if os.Geteuid() != 0 {
-		log.Printf("⚠️  TUN interface setup requires root privileges")
-		log.Printf("   Run with sudo to enable transparent proxy functionality")
-		return fmt.Errorf("insufficient privileges for TUN setup")
-	}
-
-	// Platform-specific routing setup
-	switch runtime.GOOS {
-	case "linux":
-		return setupRoutingLinux(ifaceName)
-	case "darwin":
-		return setupRoutingDarwin(ifaceName)
-	default:
-		log.Printf("⚠️  TUN routing not supported on %s", runtime.GOOS)
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
-	}
-}
-
-func setupRoutingLinux(ifaceName string) error {
-	// Linux routing setup
-	commands := [][]string{
-		{"ip", "addr", "add", "10.0.0.1/24", "dev", ifaceName},
-		{"ip", "link", "set", ifaceName, "up"},
-		{"ip", "route", "add", "10.0.0.0/24", "dev", ifaceName},
-		{"iptables", "-t", "nat", "-A", "OUTPUT", "-d", "10.0.0.0/24", "-j", "ACCEPT"},
-		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", "DNAT", "--to-destination", "10.0.0.1"},
-	}
-
-	for _, cmd := range commands {
-		if err := exec.Command(cmd[0], cmd[1:]...).Run(); err != nil {
-			log.Printf("Failed to run %v: %v", cmd, err)
-			return err
-		}
-	}
-
-	log.Printf("✅ Linux routing setup completed for %s", ifaceName)
-	return nil
-}
-
-func setupRoutingDarwin(ifaceName string) error {
-	// macOS routing setup
-	commands := [][]string{
-		{"ifconfig", ifaceName, "10.0.0.1", "10.0.0.1", "up"},
-		{"route", "add", "-net", "10.0.0.0/24", "-interface", ifaceName},
-	}
-
-	for _, cmd := range commands {
-		if err := exec.Command(cmd[0], cmd[1:]...).Run(); err != nil {
-			log.Printf("Failed to run %v: %v", cmd, err)
-			return err
-		}
-	}
-
-	log.Printf("✅ macOS routing setup completed for %s", ifaceName)
-	return nil
-}
-
-func cleanupRouting(ifaceName string) {
-	log.Printf("Cleaning up routing for %s", ifaceName)
-
-	if os.Geteuid() != 0 {
-		log.Printf("⚠️  Cannot cleanup routing without root privileges")
-		return
-	}
-
-	// Platform-specific cleanup
-	switch runtime.GOOS {
-	case "linux":
-		cleanupRoutingLinux(ifaceName)
-	case "darwin":
-		cleanupRoutingDarwin(ifaceName)
-	}
-}
-
-func cleanupRoutingLinux(ifaceName string) {
-	// Linux cleanup
-	commands := [][]string{
-		{"iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", "DNAT", "--to-destination", "10.0.0.1"},
-		{"iptables", "-t", "nat", "-D", "OUTPUT", "-d", "10.0.0.0/24", "-j", "ACCEPT"},
-		{"ip", "route", "del", "10.0.0.0/24", "dev", ifaceName},
-		{"ip", "link", "set", ifaceName, "down"},
-	}
-
-	for _, cmd := range commands {
-		exec.Command(cmd[0], cmd[1:]...).Run() // Best effort cleanup
-	}
-}
-
-func cleanupRoutingDarwin(ifaceName string) {
-	// macOS cleanup
-	commands := [][]string{
-		{"route", "delete", "-net", "10.0.0.0/24", "-interface", ifaceName},
-		{"ifconfig", ifaceName, "down"},
-	}
-
-	for _, cmd := range commands {
-		exec.Command(cmd[0], cmd[1:]...).Run() // Best effort cleanup
-	}
-}
-
-func processPackets(ctx context.Context, iface *water.Interface, rc *relayClient) {
-	buffer := make([]byte, 1500)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			n, err := iface.Read(buffer)
-			if err != nil {
-				log.Printf("TUN read error: %v", err)
-				continue
-			}
-
-			// Process the packet
-			go handlePacket(buffer[:n], rc)
-		}
-	}
-}
-
-func handlePacket(packet []byte, rc *relayClient) {
-	// Parse IP packet
-	if len(packet) < 20 {
-		return // Too short to be a valid IP packet
-	}
-
-	// Check if it's TCP
-	if packet[9] != 6 { // IP protocol 6 = TCP
-		return
-	}
-
-	// Extract source and destination IPs
-	srcIP := net.IP(packet[12:16])
-	dstIP := net.IP(packet[16:20])
-
-	// Extract source and destination ports
-	srcPort := binary.BigEndian.Uint16(packet[20:22])
-	dstPort := binary.BigEndian.Uint16(packet[22:24])
-
-	// Only handle packets destined for cluster services (10.0.0.0/24)
-	if !dstIP.Equal(net.IPv4(10, 0, 0, 0)) && !dstIP.Equal(net.IPv4(10, 0, 0, 1)) {
-		return
-	}
-
-	log.Printf("Intercepted outbound packet: %s:%d -> %s:%d", srcIP, srcPort, dstIP, dstPort)
-
-	// Create outbound connection through relay
-	// Map the destination to a cluster service
-	destination := fmt.Sprintf("%s:%d", dstIP.String(), dstPort)
-
-	// Send outbound connect request to relay
-	// We need to implement this in the relayClient
-	if err := rc.sendOutboundConnect(destination); err != nil {
-		log.Printf("Failed to send outbound connect: %v", err)
-	}
 }

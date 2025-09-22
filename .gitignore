@@ -6,6 +6,12 @@ bin/
 *.so
 *.dylib
 
+# linkerdev specific binaries
+linkerdev
+linkerdev-relay
+cmd/linkerdev/linkerdev
+cmd/linkerdev/linkerdev_new
+
 # Test binary, built with `go test -c`
 *.test
 
