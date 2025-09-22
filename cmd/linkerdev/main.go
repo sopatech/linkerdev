@@ -54,7 +54,7 @@ import (
 /* ---------- Config / constants ---------- */
 
 // Version is set at build time for releases
-var version = "v0.1.0-alpha11"
+var version = "v0.1.0-alpha12"
 
 const (
 	// Labels
