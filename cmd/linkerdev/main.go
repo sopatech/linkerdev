@@ -35,7 +35,7 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
-const version = "v0.1.0-alpha15"
+const version = "v0.1.0-alpha16"
 
 func main() {
 	var (
@@ -61,7 +61,7 @@ func main() {
 		fmt.Printf("linkerdev version %s\n", version)
 		return
 	case "install":
-		commands.InstallRelay()
+		commands.InstallRelay(version)
 		return
 	case "uninstall":
 		commands.UninstallRelay()
@@ -131,7 +131,7 @@ func main() {
 
 	// Ensure relay is running
 	remoteRPort := int32(remotePortFor(svcName, ns))
-	_, err = k8s.EnsureRelay(ctx, cs, ns, remoteRPort, lease, instance)
+	_, err = k8s.EnsureRelay(ctx, cs, ns, remoteRPort, lease, instance, version)
 	if err != nil {
 		log.Fatalf("Failed to ensure relay: %v", err)
 	}
