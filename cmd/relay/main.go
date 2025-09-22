@@ -40,7 +40,7 @@ Server behavior:
 - If CONTROL drops: all streams are closed & reset.
 */
 
-var version = "v0.1.0-alpha17"
+var version = "v0.1.0-alpha18"
 
 const (
 	tOpen            = 0x01
