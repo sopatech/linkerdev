@@ -7,8 +7,8 @@ bin/
 *.dylib
 
 # linkerdev specific binaries
-linkerdev
-linkerdev-relay
+/linkerdev
+/linkerdev-relay
 cmd/linkerdev/linkerdev
 cmd/linkerdev/linkerdev_new
 
