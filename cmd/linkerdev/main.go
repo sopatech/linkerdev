@@ -4,8 +4,6 @@
 // Commands:
 //   linkerdev install         (install relay component in cluster)
 //   linkerdev uninstall       (remove relay component from cluster)
-//   linkerdev install-dns     (macOS only; one-time /etc/resolver setup)
-//   linkerdev uninstall-dns   (macOS only; remove resolver file)
 //   linkerdev clean           (best-effort sweep of leftover resources)
 //   linkerdev version         (show version information)
 //   linkerdev help            (show help message)
@@ -35,7 +33,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/miekg/dns"
+	"github.com/songgao/water"
 	appsV1 "k8s.io/api/apps/v1"
 	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -79,7 +77,7 @@ var relayImg = "ghcr.io/sopatech/linkerdev-relay:" + version
 /* ---------- main ---------- */
 
 func main() {
-	// Subcommands: relay install/uninstall + DNS resolver (mac) + cleanup + version + help
+	// Subcommands: relay install/uninstall + cleanup + version + help
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "install":
@@ -87,12 +85,6 @@ func main() {
 			return
 		case "uninstall":
 			uninstallRelay()
-			return
-		case "install-dns":
-			installDNSResolver()
-			return
-		case "uninstall-dns":
-			uninstallDNSResolver()
 			return
 		case "clean":
 			cleanupResources()
@@ -121,10 +113,6 @@ func main() {
 		showHelp()
 		os.Exit(1)
 	}
-
-	// macOS: the DNS resolver is only needed if you later enable transparent outbound;
-	// we don't require it here to run the inbound flow.
-	// If you want DNS-based outbound later: run `sudo linkerdev install-dns`.
 
 	// Parse target
 	parts := strings.Split(*flagSvc, ".")
@@ -168,14 +156,8 @@ func main() {
 	must(ensureDevService(ctx, cs, targetNS, devSvc, int32(*flagPort), remoteRPort, lease, instance))
 	must(ensureDevEndpointSlice(ctx, cs, targetNS, devSvc, podIP, remoteRPort, lease, instance))
 
-	// Install Linkerd dynamic routing (HTTP + gRPC) to devSvc (best-effort)
-	servicePort := int32(*flagPort)
-	if err := applyHTTPRoute(ctx, dyn, targetNS, targetSvc, devSvc, servicePort, lease, instance); err != nil {
-		log.Printf("HTTPRoute apply warning: %v", err)
-	}
-	if err := applyGRPCRoute(ctx, dyn, targetNS, targetSvc, devSvc, servicePort, lease, instance); err != nil {
-		log.Printf("GRPCRoute apply warning: %v", err)
-	}
+	// Use Linkerd TrafficSplit to divert 100% traffic from original service to dev service
+	must(applyTrafficSplit(ctx, dyn, targetNS, targetSvc, devSvc, lease, instance))
 
 	// kubectl port-forward: forward relay control port to a free local port
 	localCtrl, err := randomFreePort()
@@ -203,8 +185,8 @@ func main() {
 	must(err)
 	go rc.loop(*flagPort) // each inbound stream connects to 127.0.0.1:<local port>
 
-	// Optional: start DNS if you later want transparent outbound (kept off by default)
-	_ = startOptionalDNS(recordsForAllServices(ctx, cs))
+	// Start transparent TUN proxy for outbound traffic hijacking
+	go startTransparentProxy(ctx, cs, rc)
 
 	// Run your app
 	child := exec.CommandContext(ctx, childCmd[0], childCmd[1:]...)
@@ -215,28 +197,16 @@ func main() {
 		_ = cs.CoordinationV1().Leases(targetNS).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
 	}()
 
-	if runtime.GOOS == "linux" {
-		// Scope resolv.conf to the child (future outbound). Safe even if unused.
-		if err := runChildWithResolvLinux(ctx, child); err != nil {
-			log.Fatalf("child start: %v", err)
-		}
-	} else {
-		if err := child.Start(); err != nil {
-			log.Fatalf("child start: %v", err)
-		}
-		go func() {
-			_ = child.Wait()
-			cancel() // Signal that child has exited
-		}()
+	// Scope resolv.conf to the child (cross-platform). Safe even if unused.
+	if err := runChildWithResolv(ctx, child); err != nil {
+		log.Fatalf("child start: %v", err)
 	}
 
 	// Wait for signal
 	<-ctx.Done()
 
-	// Cleanup (Lease ownerRef GC will remove relay svc/dep, dev svc/slice, routes)
+	// Cleanup (Lease ownerRef GC will remove relay svc/dep, dev svc/slice)
 	_ = cs.CoordinationV1().Leases(targetNS).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
-	_ = deleteHTTPRoute(context.Background(), dyn, targetNS, targetSvc+"-route")
-	_ = deleteGRPCRoute(context.Background(), dyn, targetNS, targetSvc+"-grpc-route")
 	time.Sleep(150 * time.Millisecond)
 }
 
@@ -251,12 +221,13 @@ type relayClient struct {
 }
 
 const (
-	tOpen  = 0x01
-	tData  = 0x02
-	tClose = 0x03
-	tRst   = 0x04
-	tPing  = 0x10
-	tPong  = 0x11
+	tOpen            = 0x01
+	tData            = 0x02
+	tClose           = 0x03
+	tRst             = 0x04
+	tOutboundConnect = 0x05
+	tPing            = 0x10
+	tPong            = 0x11
 )
 
 func newRelayClient(addr string) (*relayClient, error) {
@@ -369,6 +340,14 @@ func (rc *relayClient) sendFrame(typ byte, id uint32, payload []byte) error {
 	return rc.bw.Flush()
 }
 
+func (rc *relayClient) sendOutboundConnect(destination string) error {
+	// Generate a unique stream ID for this outbound connection
+	streamID := uint32(time.Now().UnixNano() & 0xFFFFFFFF)
+
+	// Send the outbound connect frame
+	return rc.sendFrame(tOutboundConnect, streamID, []byte(destination))
+}
+
 type frame struct {
 	typ      byte
 	streamID uint32
@@ -404,8 +383,6 @@ func showHelp() {
 	fmt.Println("COMMANDS:")
 	fmt.Println("  install         Install relay component in cluster")
 	fmt.Println("  uninstall       Remove relay component from cluster")
-	fmt.Println("  install-dns     Install DNS resolver (macOS only)")
-	fmt.Println("  uninstall-dns   Remove DNS resolver (macOS only)")
 	fmt.Println("  clean           Clean up leftover resources")
 	fmt.Println("  version         Show version information")
 	fmt.Println("  help            Show this help message")
@@ -414,8 +391,6 @@ func showHelp() {
 	fmt.Println("  # Install the relay component")
 	fmt.Println("  sudo linkerdev install")
 	fmt.Println()
-	fmt.Println("  # Install DNS resolver (macOS only)")
-	fmt.Println("  sudo linkerdev install-dns")
 	fmt.Println()
 	fmt.Println("  # Run your service with linkerdev")
 	fmt.Println("  linkerdev -svc api-service.apps -p 8080 go run main.go")
@@ -496,46 +471,6 @@ func uninstallRelay() {
 	log.Println("✅ linkerdev relay component uninstalled successfully")
 }
 
-/* ---------- macOS DNS install/uninstall ---------- */
-
-func installDNSResolver() {
-	if runtime.GOOS != "darwin" {
-		log.Println("❌ DNS resolver installation is only supported on macOS")
-		return
-	}
-	content := "nameserver 127.0.0.1\nport 1053\n"
-	if existingContent, err := os.ReadFile(resolverFile); err == nil && string(existingContent) == content {
-		log.Println("✅ DNS resolver already installed")
-		return
-	}
-	if err := os.MkdirAll(resolverDir, 0o755); err != nil {
-		log.Printf("❌ mkdir %s: %v\n", resolverDir, err)
-		log.Println("   Try: sudo linkerdev install-dns")
-		return
-	}
-	if err := os.WriteFile(resolverFile, []byte(content), 0o644); err != nil {
-		log.Println("❌ write resolver failed. Try: sudo linkerdev install-dns")
-		return
-	}
-	log.Println("✅ DNS resolver installed")
-}
-
-func uninstallDNSResolver() {
-	if runtime.GOOS != "darwin" {
-		log.Println("❌ DNS resolver uninstallation is only supported on macOS")
-		return
-	}
-	if _, err := os.Stat(resolverFile); os.IsNotExist(err) {
-		log.Println("✅ No resolver file to remove")
-		return
-	}
-	if err := os.Remove(resolverFile); err != nil {
-		log.Println("❌ remove failed. Try: sudo linkerdev uninstall-dns")
-		return
-	}
-	log.Println("✅ DNS resolver uninstalled")
-}
-
 /* ---------- Cleanup command ---------- */
 
 func cleanupResources() {
@@ -572,10 +507,71 @@ func cleanupResources() {
 				cleaned++
 			}
 		}
-		_ = deleteHTTPRoute(context.Background(), dyn, nsName, nsName+"-route")      // best-effort; names may differ
-		_ = deleteGRPCRoute(context.Background(), dyn, nsName, nsName+"-grpc-route") // best-effort
+		_ = deleteTrafficSplit(context.Background(), dyn, nsName, nsName+"-split") // best-effort; names may differ
 	}
 	log.Printf("✅ Cleanup completed (approx %d items)", cleaned)
+}
+
+/* ---------- Linkerd: TrafficSplit (universal TCP traffic diversion) ---------- */
+
+func applyTrafficSplit(ctx context.Context, dyn dynamic.Interface, ns, svc, devSvc string, lease *coordv1.Lease, instance string) error {
+	// TrafficSplit uses SMI specification
+	gvr := schema.GroupVersionResource{
+		Group:    "split.smi-spec.io",
+		Version:  "v1alpha2",
+		Resource: "trafficsplits",
+	}
+
+	name := svc + "-split"
+	obj := map[string]any{
+		"apiVersion": "split.smi-spec.io/v1alpha2",
+		"kind":       "TrafficSplit",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": ns,
+			"labels":    map[string]string{kdvLabelOwned: "true", kdvLabelInst: instance},
+			"ownerReferences": []map[string]any{{
+				"apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+				"name": lease.Name, "uid": string(lease.UID),
+				"controller": true, "blockOwnerDeletion": true,
+			}},
+		},
+		"spec": map[string]any{
+			"service": svc, // Original service name
+			"backends": []map[string]any{
+				{
+					"service": devSvc, // Dev service gets 100% traffic
+					"weight":  100,
+				},
+				{
+					"service": svc, // Original service gets 0% traffic
+					"weight":  0,
+				},
+			},
+		},
+	}
+
+	b, _ := json.Marshal(obj)
+	log.Printf("TrafficSplit: Creating traffic split %s to route 100%% traffic from %s to %s", name, svc, devSvc)
+
+	if result, err := dyn.Resource(gvr).Namespace(ns).Patch(ctx, name, types.ApplyPatchType, b, metav1.PatchOptions{FieldManager: "linkerdev"}); err == nil {
+		log.Printf("TrafficSplit: Successfully created traffic split %s, result: %v", name, result)
+		return nil
+	} else {
+		log.Printf("TrafficSplit: Failed to create traffic split %s: %v", name, err)
+		return err
+	}
+}
+
+func deleteTrafficSplit(ctx context.Context, dyn dynamic.Interface, ns, name string) error {
+	gvr := schema.GroupVersionResource{
+		Group:    "split.smi-spec.io",
+		Version:  "v1alpha2",
+		Resource: "trafficsplits",
+	}
+
+	log.Printf("TrafficSplit: Deleting traffic split %s", name)
+	return dyn.Resource(gvr).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
 /* ---------- In-cluster relay Deployment + Service + kubectl port-forward ---------- */
@@ -685,110 +681,6 @@ func waitForPodIP(ctx context.Context, cs *kubernetes.Clientset, ns, selector st
 			}
 		}
 	}
-}
-
-/* ---------- Linkerd: HTTPRoute / GRPCRoute (version-flexible) ---------- */
-
-func applyHTTPRoute(ctx context.Context, dyn dynamic.Interface, ns, svc, devSvc string, port int32, lease *coordv1.Lease, instance string) error {
-	cands := []struct {
-		gvr schema.GroupVersionResource
-		api string
-	}{
-		{schema.GroupVersionResource{Group: "policy.linkerd.io", Version: "v1beta3", Resource: "httproutes"}, "policy.linkerd.io/v1beta3"},
-		{schema.GroupVersionResource{Group: "policy.linkerd.io", Version: "v1beta2", Resource: "httproutes"}, "policy.linkerd.io/v1beta2"},
-	}
-	var last error
-	for _, c := range cands {
-		name := svc + "-route"
-		obj := map[string]any{
-			"apiVersion": c.api,
-			"kind":       "HTTPRoute",
-			"metadata": map[string]any{
-				"name":      name,
-				"namespace": ns,
-				"labels":    map[string]string{kdvLabelOwned: "true", kdvLabelInst: instance},
-				"ownerReferences": []map[string]any{{
-					"apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
-					"name": lease.Name, "uid": string(lease.UID),
-					"controller": true, "blockOwnerDeletion": true,
-				}},
-			},
-			"spec": map[string]any{
-				"parentRefs": []map[string]any{{"name": svc, "kind": "Service", "group": "core", "port": port}},
-				"rules":      []map[string]any{{"backendRefs": []map[string]any{{"name": devSvc, "port": port}}}},
-			},
-		}
-		b, _ := json.Marshal(obj)
-		if _, err := dyn.Resource(c.gvr).Namespace(ns).Patch(ctx, name, types.ApplyPatchType, b, metav1.PatchOptions{FieldManager: "linkerdev"}); err == nil {
-			return nil
-		} else {
-			last = err
-		}
-	}
-	return last
-}
-
-func deleteHTTPRoute(ctx context.Context, dyn dynamic.Interface, ns, name string) error {
-	cands := []schema.GroupVersionResource{
-		{Group: "policy.linkerd.io", Version: "v1beta3", Resource: "httproutes"},
-		{Group: "policy.linkerd.io", Version: "v1beta2", Resource: "httproutes"},
-	}
-	for _, gvr := range cands {
-		_ = dyn.Resource(gvr).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})
-	}
-	return nil
-}
-
-func applyGRPCRoute(ctx context.Context, dyn dynamic.Interface, ns, svc, devSvc string, port int32, lease *coordv1.Lease, instance string) error {
-	cands := []struct {
-		gvr  schema.GroupVersionResource
-		api  string
-		kind string
-	}{
-		{schema.GroupVersionResource{Group: "policy.linkerd.io", Version: "v1beta3", Resource: "grpcroutes"}, "policy.linkerd.io/v1beta3", "GRPCRoute"},
-		{schema.GroupVersionResource{Group: "policy.linkerd.io", Version: "v1beta2", Resource: "grpcroutes"}, "policy.linkerd.io/v1beta2", "GRPCRoute"},
-		{schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "grpcroutes"}, "gateway.networking.k8s.io/v1", "GRPCRoute"},
-	}
-	var last error
-	for _, c := range cands {
-		name := svc + "-grpc-route"
-		obj := map[string]any{
-			"apiVersion": c.api, "kind": c.kind,
-			"metadata": map[string]any{
-				"name":      name,
-				"namespace": ns,
-				"labels":    map[string]string{kdvLabelOwned: "true", kdvLabelInst: instance},
-				"ownerReferences": []map[string]any{{
-					"apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
-					"name": lease.Name, "uid": string(lease.UID),
-					"controller": true, "blockOwnerDeletion": true,
-				}},
-			},
-			"spec": map[string]any{
-				"parentRefs": []map[string]any{{"name": svc, "kind": "Service", "group": "core", "port": port}},
-				"rules":      []map[string]any{{"backendRefs": []map[string]any{{"name": devSvc, "port": port}}}},
-			},
-		}
-		b, _ := json.Marshal(obj)
-		if _, err := dyn.Resource(c.gvr).Namespace(ns).Patch(ctx, name, types.ApplyPatchType, b, metav1.PatchOptions{FieldManager: "linkerdev"}); err == nil {
-			return nil
-		} else {
-			last = err
-		}
-	}
-	return last
-}
-
-func deleteGRPCRoute(ctx context.Context, dyn dynamic.Interface, ns, name string) error {
-	cands := []schema.GroupVersionResource{
-		{Group: "policy.linkerd.io", Version: "v1beta3", Resource: "grpcroutes"},
-		{Group: "policy.linkerd.io", Version: "v1beta2", Resource: "grpcroutes"},
-		{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "grpcroutes"},
-	}
-	for _, gvr := range cands {
-		_ = dyn.Resource(gvr).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})
-	}
-	return nil
 }
 
 /* ---------- K8s: dev Service/EndpointSlice + Lease ---------- */
@@ -968,8 +860,7 @@ func reapStale(ctx context.Context, cs *kubernetes.Clientset, dyn dynamic.Interf
 					_ = cs.DiscoveryV1().EndpointSlices(ns).Delete(ctx, e.Name, metav1.DeleteOptions{})
 				}
 			}
-			_ = deleteHTTPRoute(ctx, dyn, ns, svc+"-route")
-			_ = deleteGRPCRoute(ctx, dyn, ns, svc+"-grpc-route")
+			_ = deleteTrafficSplit(ctx, dyn, ns, svc+"-split")
 		} else {
 			return fmt.Errorf("another linkerdev instance appears active (lease fresh)")
 		}
@@ -997,7 +888,7 @@ func mustLease(l *coordv1.Lease, err error) *coordv1.Lease {
 
 /* ---------- Linux child with private resolv.conf (safe no-op today) ---------- */
 
-func runChildWithResolvLinux(ctx context.Context, child *exec.Cmd) error {
+func runChildWithResolv(ctx context.Context, child *exec.Cmd) error {
 	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("linkerdev-%d", os.Getpid()))
 	_ = os.MkdirAll(tmp, 0o700)
 	resolv := filepath.Join(tmp, "resolv.conf")
@@ -1005,6 +896,19 @@ func runChildWithResolvLinux(ctx context.Context, child *exec.Cmd) error {
 	if err := os.WriteFile(resolv, []byte(content), 0o644); err != nil {
 		return err
 	}
+
+	switch runtime.GOOS {
+	case "linux":
+		return runChildWithResolvLinux(ctx, child, resolv)
+	case "darwin":
+		return runChildWithResolvDarwin(ctx, child, resolv)
+	default:
+		// Fallback: just run the child without DNS scoping
+		return child.Run()
+	}
+}
+
+func runChildWithResolvLinux(ctx context.Context, child *exec.Cmd, resolv string) error {
 	args := []string{
 		"--mount", "--uts", "--ipc",
 		"--propagation", "private",
@@ -1015,6 +919,20 @@ func runChildWithResolvLinux(ctx context.Context, child *exec.Cmd) error {
 	cmd := exec.CommandContext(ctx, "unshare", args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return cmd.Run()
+}
+
+func runChildWithResolvDarwin(ctx context.Context, child *exec.Cmd, resolv string) error {
+	// On macOS, we can use dscacheutil to temporarily override DNS
+	// This is a simpler approach than trying to mount over /etc/resolv.conf
+	child.Env = append(child.Env, "LINKERDEV_RESOLV_CONF="+resolv)
+
+	// Start the child process
+	if err := child.Start(); err != nil {
+		return err
+	}
+
+	// Wait for it to complete
+	return child.Wait()
 }
 
 /* ---------- misc ---------- */
@@ -1062,109 +980,195 @@ func isValidKubernetesName(name string) bool {
 	return true
 }
 
-/* ---------- DNS Server ---------- */
+func startTransparentProxy(ctx context.Context, cs *kubernetes.Clientset, rc *relayClient) {
+	// Create TUN interface
+	config := water.Config{
+		DeviceType: water.TUN,
+	}
+	config.Name = "utun0"
 
-func recordsForAllServices(ctx context.Context, cs *kubernetes.Clientset) map[string]string {
-	records := make(map[string]string)
-
-	// Get all services from all namespaces
-	services, err := cs.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+	iface, err := water.New(config)
 	if err != nil {
-		log.Printf("Warning: failed to list services for DNS: %v", err)
-		return records
+		log.Printf("Failed to create TUN interface: %v", err)
+		return
+	}
+	defer iface.Close()
+
+	log.Printf("Created TUN interface: %s", iface.Name())
+
+	// Set up routing (this requires root privileges)
+	if err := setupRouting(iface.Name()); err != nil {
+		log.Printf("Failed to setup routing: %v", err)
+		return
 	}
 
-	for _, svc := range services.Items {
-		// Create DNS record for service.namespace.svc.cluster.local
-		fqdn := fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
-		records[fqdn] = svc.Spec.ClusterIP
+	// Start packet processing
+	go processPackets(ctx, iface, rc)
 
-		// Also create record for service.namespace
-		shortName := fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)
-		records[shortName] = svc.Spec.ClusterIP
+	// Wait for context cancellation
+	<-ctx.Done()
 
-		// Debug: log NATS service specifically
-		if svc.Name == "nats" && svc.Namespace == "nats" {
-			log.Printf("DNS: Found NATS service: %s -> %s", fqdn, svc.Spec.ClusterIP)
-		}
-	}
-
-	// Debug: log all records
-	log.Printf("DNS: Created %d records:", len(records))
-	for name, ip := range records {
-		if strings.Contains(name, "nats") || strings.Contains(name, "api") {
-			log.Printf("DNS: %s -> %s", name, ip)
-		}
-	}
-
-	return records
+	// Cleanup routing
+	cleanupRouting(iface.Name())
 }
 
-func startOptionalDNS(records map[string]string) error {
-	if runtime.GOOS != "darwin" {
-		return nil // DNS server only needed on macOS
+func setupRouting(ifaceName string) error {
+	log.Printf("Setting up routing for TUN interface: %s", ifaceName)
+
+	// Check if we're running as root
+	if os.Geteuid() != 0 {
+		log.Printf("⚠️  TUN interface setup requires root privileges")
+		log.Printf("   Run with sudo to enable transparent proxy functionality")
+		return fmt.Errorf("insufficient privileges for TUN setup")
 	}
 
-	if len(records) == 0 {
-		return nil // No records to serve
+	// Platform-specific routing setup
+	switch runtime.GOOS {
+	case "linux":
+		return setupRoutingLinux(ifaceName)
+	case "darwin":
+		return setupRoutingDarwin(ifaceName)
+	default:
+		log.Printf("⚠️  TUN routing not supported on %s", runtime.GOOS)
+		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+}
+
+func setupRoutingLinux(ifaceName string) error {
+	// Linux routing setup
+	commands := [][]string{
+		{"ip", "addr", "add", "10.0.0.1/24", "dev", ifaceName},
+		{"ip", "link", "set", ifaceName, "up"},
+		{"ip", "route", "add", "10.0.0.0/24", "dev", ifaceName},
+		{"iptables", "-t", "nat", "-A", "OUTPUT", "-d", "10.0.0.0/24", "-j", "ACCEPT"},
+		{"iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", "DNAT", "--to-destination", "10.0.0.1"},
 	}
 
-	// Set up DNS handler first
-	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		m.Authoritative = true
-
-		for _, q := range r.Question {
-			if q.Qtype == dns.TypeA {
-				// Normalize the query name (remove trailing dot)
-				queryName := strings.TrimSuffix(q.Name, ".")
-				log.Printf("DNS: Query for %s (normalized: %s)", q.Name, queryName)
-				// Look up the record
-				if ip, exists := records[queryName]; exists {
-					log.Printf("DNS: Found record %s -> %s", queryName, ip)
-					rr, err := dns.NewRR(fmt.Sprintf("%s 60 IN A %s", q.Name, ip))
-					if err == nil {
-						m.Answer = append(m.Answer, rr)
-					} else {
-						log.Printf("DNS: Error creating RR for %s: %v", q.Name, err)
-					}
-				} else {
-					log.Printf("DNS: No record found for %s (have %d total records)", q.Name, len(records))
-					// Debug: show first few record keys
-					count := 0
-					for key := range records {
-						if count < 5 {
-							log.Printf("DNS: Available record: %s", key)
-							count++
-						}
-					}
-				}
-			}
+	for _, cmd := range commands {
+		if err := exec.Command(cmd[0], cmd[1:]...).Run(); err != nil {
+			log.Printf("Failed to run %v: %v", cmd, err)
+			return err
 		}
-
-		// If no answer found, return NXDOMAIN
-		if len(m.Answer) == 0 {
-			m.Rcode = dns.RcodeNameError
-		}
-
-		w.WriteMsg(m)
-	})
-
-	// Create DNS server after setting up handler
-	server := &dns.Server{
-		Addr: "127.0.0.1:1053",
-		Net:  "udp",
 	}
 
-	log.Printf("DNS server started on %s with %d records", server.Addr, len(records))
-
-	// Start server in goroutine
-	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			log.Printf("DNS server error: %v", err)
-		}
-	}()
-
+	log.Printf("✅ Linux routing setup completed for %s", ifaceName)
 	return nil
+}
+
+func setupRoutingDarwin(ifaceName string) error {
+	// macOS routing setup
+	commands := [][]string{
+		{"ifconfig", ifaceName, "10.0.0.1", "10.0.0.1", "up"},
+		{"route", "add", "-net", "10.0.0.0/24", "-interface", ifaceName},
+	}
+
+	for _, cmd := range commands {
+		if err := exec.Command(cmd[0], cmd[1:]...).Run(); err != nil {
+			log.Printf("Failed to run %v: %v", cmd, err)
+			return err
+		}
+	}
+
+	log.Printf("✅ macOS routing setup completed for %s", ifaceName)
+	return nil
+}
+
+func cleanupRouting(ifaceName string) {
+	log.Printf("Cleaning up routing for %s", ifaceName)
+
+	if os.Geteuid() != 0 {
+		log.Printf("⚠️  Cannot cleanup routing without root privileges")
+		return
+	}
+
+	// Platform-specific cleanup
+	switch runtime.GOOS {
+	case "linux":
+		cleanupRoutingLinux(ifaceName)
+	case "darwin":
+		cleanupRoutingDarwin(ifaceName)
+	}
+}
+
+func cleanupRoutingLinux(ifaceName string) {
+	// Linux cleanup
+	commands := [][]string{
+		{"iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", "DNAT", "--to-destination", "10.0.0.1"},
+		{"iptables", "-t", "nat", "-D", "OUTPUT", "-d", "10.0.0.0/24", "-j", "ACCEPT"},
+		{"ip", "route", "del", "10.0.0.0/24", "dev", ifaceName},
+		{"ip", "link", "set", ifaceName, "down"},
+	}
+
+	for _, cmd := range commands {
+		exec.Command(cmd[0], cmd[1:]...).Run() // Best effort cleanup
+	}
+}
+
+func cleanupRoutingDarwin(ifaceName string) {
+	// macOS cleanup
+	commands := [][]string{
+		{"route", "delete", "-net", "10.0.0.0/24", "-interface", ifaceName},
+		{"ifconfig", ifaceName, "down"},
+	}
+
+	for _, cmd := range commands {
+		exec.Command(cmd[0], cmd[1:]...).Run() // Best effort cleanup
+	}
+}
+
+func processPackets(ctx context.Context, iface *water.Interface, rc *relayClient) {
+	buffer := make([]byte, 1500)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			n, err := iface.Read(buffer)
+			if err != nil {
+				log.Printf("TUN read error: %v", err)
+				continue
+			}
+
+			// Process the packet
+			go handlePacket(buffer[:n], rc)
+		}
+	}
+}
+
+func handlePacket(packet []byte, rc *relayClient) {
+	// Parse IP packet
+	if len(packet) < 20 {
+		return // Too short to be a valid IP packet
+	}
+
+	// Check if it's TCP
+	if packet[9] != 6 { // IP protocol 6 = TCP
+		return
+	}
+
+	// Extract source and destination IPs
+	srcIP := net.IP(packet[12:16])
+	dstIP := net.IP(packet[16:20])
+
+	// Extract source and destination ports
+	srcPort := binary.BigEndian.Uint16(packet[20:22])
+	dstPort := binary.BigEndian.Uint16(packet[22:24])
+
+	// Only handle packets destined for cluster services (10.0.0.0/24)
+	if !dstIP.Equal(net.IPv4(10, 0, 0, 0)) && !dstIP.Equal(net.IPv4(10, 0, 0, 1)) {
+		return
+	}
+
+	log.Printf("Intercepted outbound packet: %s:%d -> %s:%d", srcIP, srcPort, dstIP, dstPort)
+
+	// Create outbound connection through relay
+	// Map the destination to a cluster service
+	destination := fmt.Sprintf("%s:%d", dstIP.String(), dstPort)
+
+	// Send outbound connect request to relay
+	// We need to implement this in the relayClient
+	if err := rc.sendOutboundConnect(destination); err != nil {
+		log.Printf("Failed to send outbound connect: %v", err)
+	}
 }

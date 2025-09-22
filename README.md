@@ -1,21 +1,21 @@
 # linkerdev
 
-A development tool that enables seamless local development with Kubernetes services by creating dynamic DNS resolution and SSH tunnels. Designed for minikube in Docker mode with Linkerd service mesh.
+A Telepresence-like development tool that enables seamless local development with Kubernetes services using Linkerd traffic diversion and TUN interface packet interception. Designed for clusters with Linkerd service mesh.
 
 ## Overview
 
 linkerdev consists of two components:
-- **CLI**: Local command-line tool that manages the development environment
-- **Relay**: In-cluster component that handles traffic forwarding
+- **CLI**: Local command-line tool that manages the development environment and TUN interface
+- **Relay**: In-cluster component that handles bidirectional traffic forwarding
 
 ## Features
 
-- 🔄 **Dynamic DNS Resolution**: Automatically resolves cluster services to localhost
-- 🚇 **SSH Tunneling**: Creates secure tunnels from cluster to local services
-- 🎯 **Service Targeting**: Route specific services to your local development environment
+- 🎯 **True Service Hijacking**: Automatically diverts traffic from original services to your local development environment
+- 🔄 **Bidirectional Traffic**: Handles both inbound (cluster→local) and outbound (local→cluster) traffic
+- 🔗 **Linkerd Integration**: Uses Linkerd TrafficSplit for automatic TCP traffic diversion
+- 🌐 **TUN Interface**: Intercepts local outbound connections for transparent cluster access
 - 🔧 **Easy Setup**: Simple installation and configuration
-- 🐳 **Minikube Docker Mode**: Optimized for minikube with Docker driver
-- 🔗 **Linkerd Integration**: Works seamlessly with Linkerd service mesh
+- 🚀 **No Manual Configuration**: Other services can call original service names without changes
 
 ## Installation
 
@@ -50,9 +50,9 @@ sudo linkerdev install
 
 ## Prerequisites
 
-- **minikube** with Docker driver
-- **Linkerd** service mesh installed in your cluster
-- **macOS** (for DNS resolver functionality)
+- **Kubernetes cluster** with Linkerd service mesh installed
+- **Root privileges** (for TUN interface setup)
+- **macOS or Linux** (TUN interface support)
 
 ## Quick Start
 
@@ -61,15 +61,12 @@ sudo linkerdev install
    sudo linkerdev install
    ```
 
-2. **Install DNS resolver** (macOS only):
+2. **Run your service with linkerdev** (requires root for TUN interface):
    ```bash
-   sudo linkerdev install-dns
+   sudo linkerdev -svc api-service.apps -p 8080 go run main.go
    ```
 
-3. **Run your service with linkerdev**:
-   ```bash
-   linkerdev -svc my-service.namespace -p 8080 go run main.go
-   ```
+3. **That's it!** Other services in the cluster calling `api-service` will now automatically reach your local development version.
 
 ## Usage
 
@@ -96,17 +93,28 @@ linkerdev -svc python-service.apps -p 8000 python app.py
 
 - `linkerdev install` - Install the relay component in your cluster
 - `linkerdev uninstall` - Remove the relay component
-- `linkerdev install-dns` - Install DNS resolver (macOS only)
-- `linkerdev uninstall-dns` - Remove DNS resolver (macOS only)
 - `linkerdev clean` - Clean up leftover Kubernetes resources
 - `linkerdev version` - Show version information
+- `linkerdev help` - Show help message
 
 ## How It Works
 
-1. **DNS Resolution**: linkerdev runs a local DNS server that resolves cluster service names to localhost
-2. **SSH Tunneling**: Creates reverse SSH tunnels from the cluster to your local machine
-3. **Traffic Forwarding**: The relay component forwards traffic from cluster services to your local development server
-4. **Dynamic Routing**: Automatically updates routing as services change
+### Inbound Traffic (Cluster → Local)
+1. **Service Creation**: Creates a `-dev` service (e.g., `api-service-dev`) pointing to the relay pod
+2. **TrafficSplit**: Uses Linkerd TrafficSplit to divert 100% of traffic from `api-service` to `api-service-dev`
+3. **Relay Forwarding**: Relay receives cluster traffic and forwards it to your local app via control connection
+
+### Outbound Traffic (Local → Cluster)
+1. **TUN Interface**: Creates a TUN interface to intercept local app's outbound connections
+2. **Packet Interception**: Captures packets when your local app tries to reach cluster services
+3. **Relay Connection**: Sends outbound connect requests to relay, which connects to actual cluster services
+4. **Bidirectional Forwarding**: Relay forwards data between local app and cluster services
+
+### Key Benefits
+- **No Manual Configuration**: Other services can call original service names without changes
+- **Universal TCP Support**: Works with any TCP protocol (HTTP, gRPC, databases, custom protocols)
+- **Automatic Cleanup**: When linkerdev exits, TrafficSplit is deleted and traffic flows back to original services
+- **True Service Hijacking**: Works like Telepresence with automatic traffic diversion
 
 ## Architecture
 
@@ -116,50 +124,91 @@ linkerdev -svc python-service.apps -p 8000 python app.py
 │   Environment   │    │   Cluster        │    │   Services      │
 │                 │    │                  │    │                 │
 │  ┌───────────┐  │    │  ┌────────────┐  │    │  ┌───────────┐  │
-│  │   Your    │  │◄───┤  │  linkerdev │  │◄───┤  │   NATS    │  │
+│  │   Your    │◄─┼────┤  │  linkerdev │  │◄───┤  │   NATS    │  │
 │  │   API     │  │    │  │   Relay    │  │    │  │  Service  │  │
-│  │ (port 8080)│  │    │  │            │  │    │  │           │  │
+│  │(port 8080)│  │    │  │            │  │    │  │           │  │
 │  └───────────┘  │    │  └────────────┘  │    │  └───────────┘  │
-│                 │    │                  │    │                 │
-│  ┌───────────┐  │    │                  │    │  ┌───────────┐  │
-│  │   DNS     │  │    │                  │    │  │  Other    │  │
-│  │  Server   │  │    │                  │    │  │ Services  │  │
-│  │(port 1053)│  │    │                  │    │  │           │  │
-│  └───────────┘  │    │                  │    │  └───────────┘  │
+│        │        │    │         │        │    │                 │
+│  ┌───────────┐  │    │  ┌────────────┐  │    │  ┌───────────┐  │
+│  │    TUN    │  │    │  │   Linkerd  │  │    │  │  Other    │  │
+│  │ Interface │  │    │  │TrafficSplit│  │    │  │ Services  │  │
+│  │           │  │    │  │            │  │    │  │           │  │
+│  └───────────┘  │    │  └────────────┘  │    │  └───────────┘  │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
+        │                        │
+        └─── Outbound Traffic ───┘
+        └─── Inbound Traffic ────┘
 ```
+
+### Traffic Flow:
+- **Inbound**: Cluster Services → Linkerd TrafficSplit → Dev Service → Relay → Local App
+- **Outbound**: Local App → TUN Interface → Relay → Cluster Services
+
+## TrafficSplit Strategy
+
+linkerdev uses Linkerd's **TrafficSplit** resource to achieve true service hijacking:
+
+### How TrafficSplit Works:
+1. **Original Service**: `api-service` (unchanged, continues to exist)
+2. **Dev Service**: `api-service-dev` (created by linkerdev, points to relay)
+3. **TrafficSplit**: Routes 100% of traffic from `api-service` to `api-service-dev`
+
+### Example TrafficSplit Configuration:
+```yaml
+apiVersion: split.smi-spec.io/v1alpha2
+kind: TrafficSplit
+metadata:
+  name: api-service-split
+  namespace: apps
+spec:
+  service: api-service          # Original service name
+  backends:
+  - service: api-service-dev    # Dev service (100% traffic)
+    weight: 100
+  - service: api-service        # Original service (0% traffic)
+    weight: 0
+```
+
+### Benefits:
+- ✅ **No Service Changes**: Calling services still use `api-service` name
+- ✅ **Universal Protocol Support**: Works with any TCP protocol
+- ✅ **Automatic Cleanup**: TrafficSplit deletion restores normal traffic flow
+- ✅ **Zero Downtime**: Seamless traffic diversion and restoration
 
 ## Configuration
 
 ### Environment Variables
 
 - `KUBECONFIG`: Path to your Kubernetes config file (default: `~/.kube/config`)
-- `LINKERDEV_NAMESPACE`: Namespace for linkerdev resources (default: `kube-system`)
 
-### DNS Configuration
+### TUN Interface
 
-On macOS, linkerdev automatically configures `/etc/resolver/svc.cluster.local` to point to its DNS server.
+The TUN interface requires root privileges for:
+- Creating the TUN device
+- Setting up routing rules
+- Configuring iptables (Linux) or route tables (macOS)
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Permission denied when installing DNS resolver**:
+1. **Permission denied for TUN interface**:
    ```bash
-   sudo linkerdev install-dns
+   sudo linkerdev -svc api-service.apps -p 8080 go run main.go
    ```
 
-2. **SSH connection timeout**:
-   - Ensure your cluster supports SSH access
+2. **Relay connection timeout**:
    - Check that the relay component is running: `kubectl get pods -n kube-system | grep linkerdev`
+   - Verify Linkerd is installed: `linkerd check`
 
-3. **DNS resolution not working**:
-   - Verify the DNS resolver is installed: `cat /etc/resolver/svc.cluster.local`
-   - Check that linkerdev is running: `lsof -i :1053`
+3. **Traffic not being diverted**:
+   - Ensure Linkerd TrafficSplit resource is created: `kubectl get trafficsplit -n <namespace>`
+   - Check that the dev service exists: `kubectl get svc -n <namespace> | grep -dev`
+   - Verify TrafficSplit is routing 100% to dev service: `kubectl describe trafficsplit <service-name>-split -n <namespace>`
 
-4. **Service not accessible**:
-   - Ensure the service exists in the cluster: `kubectl get svc -n <namespace>`
-   - Check that your local service is running on the specified port
+4. **Outbound connections not working**:
+   - Verify TUN interface is created: `ip link show utun0` (Linux) or `ifconfig utun0` (macOS)
+   - Check routing rules: `ip route show` (Linux) or `netstat -rn` (macOS)
 
 ### Debug Mode
 

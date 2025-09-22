@@ -28,6 +28,7 @@ Types:
   0x02 DATA    (both directions) : payload bytes
   0x03 CLOSE   (both directions) : half-close (FIN); no payload
   0x04 RST     (both directions) : abort; no payload
+  0x05 OUTBOUND_CONNECT (client->server) : begin new outbound stream with destination
   0x10 PING    (either)          : keepalive; optional payload
   0x11 PONG    (either)          : reply to PING
 
@@ -42,12 +43,13 @@ Server behavior:
 var version = "v0.1.0-alpha13"
 
 const (
-	tOpen  = 0x01
-	tData  = 0x02
-	tClose = 0x03
-	tRst   = 0x04
-	tPing  = 0x10
-	tPong  = 0x11
+	tOpen            = 0x01
+	tData            = 0x02
+	tClose           = 0x03
+	tRst             = 0x04
+	tOutboundConnect = 0x05
+	tPing            = 0x10
+	tPong            = 0x11
 
 	writeBuf = 64 << 10 // 64KiB framing buffer
 )
@@ -215,6 +217,8 @@ func (rs *relayServer) handleControl(c net.Conn) {
 			}
 		case tRst:
 			rs.closeStream(fr.streamID)
+		case tOutboundConnect:
+			rs.handleOutboundConnect(fr.streamID, string(fr.payload))
 		default:
 			// unknown; ignore
 		}
@@ -257,6 +261,44 @@ func (rs *relayServer) runListen() error {
 		}
 		go rs.handleInbound(cc)
 	}
+}
+
+func (rs *relayServer) handleOutboundConnect(streamID uint32, destination string) {
+	log.Printf("outbound connect request: streamID=%d, destination=%s", streamID, destination)
+
+	// Connect to the destination service in the cluster
+	conn, err := net.Dial("tcp", destination)
+	if err != nil {
+		log.Printf("failed to connect to %s: %v", destination, err)
+		rs.sendFrame(tRst, streamID, nil)
+		return
+	}
+
+	// Create stream and store it
+	st := &stream{id: streamID, conn: conn}
+	rs.streams.Store(streamID, st)
+
+	// Start forwarding data from cluster to local
+	go func() {
+		defer rs.closeStream(streamID)
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				rs.sendFrame(tData, streamID, buf[:n])
+			}
+			if err != nil {
+				if err != io.EOF {
+					rs.sendFrame(tRst, streamID, nil)
+				} else {
+					rs.sendFrame(tClose, streamID, nil)
+				}
+				return
+			}
+		}
+	}()
+
+	log.Printf("outbound connection established: streamID=%d, destination=%s", streamID, destination)
 }
 
 func (rs *relayServer) handleInbound(c net.Conn) {
