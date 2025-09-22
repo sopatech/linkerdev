@@ -177,11 +177,13 @@ func (rs *relayServer) handleControl(c net.Conn) {
 	// Close previous control connection (drops all streams)
 	if rs.ctrlConn != nil {
 		_ = rs.ctrlConn.Close()
-		rs.dropAllStreams()
 	}
 	rs.ctrlConn = c
 	rs.writer = bw
 	rs.mu.Unlock()
+
+	// Drop all streams outside the mutex to avoid deadlock
+	rs.dropAllStreams()
 
 	// Reader loop
 	br := bufio.NewReader(c)
@@ -267,6 +269,7 @@ func (rs *relayServer) handleInbound(c net.Conn) {
 
 	// pump data to control
 	go func() {
+		defer rs.closeStream(id) // Ensure stream is always cleaned up
 		buf := make([]byte, 64<<10)
 		for {
 			n, err := c.Read(buf)
@@ -279,7 +282,6 @@ func (rs *relayServer) handleInbound(c net.Conn) {
 				} else {
 					rs.sendFrame(tClose, id, nil)
 				}
-				rs.closeStream(id)
 				return
 			}
 		}
@@ -306,11 +308,14 @@ func (rs *relayServer) hasControl() bool {
 }
 
 func (rs *relayServer) allocID() uint32 {
-	id := atomic.AddUint32(&rs.nextID, 1)
-	if id == 0 {
-		id = atomic.AddUint32(&rs.nextID, 1)
+	for {
+		id := atomic.AddUint32(&rs.nextID, 1)
+		if id != 0 {
+			return id
+		}
+		// If we wrapped around to 0, try again
+		// This is extremely unlikely in practice but ensures correctness
 	}
-	return id
 }
 
 func (rs *relayServer) streamByID(id uint32) (*stream, bool) {

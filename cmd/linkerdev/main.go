@@ -131,6 +131,14 @@ func main() {
 		log.Fatalf("svc must be name.ns")
 	}
 	targetSvc, targetNS := parts[0], parts[1]
+
+	// Validate service name and namespace
+	if targetSvc == "" || targetNS == "" {
+		log.Fatalf("service name and namespace cannot be empty")
+	}
+	if !isValidKubernetesName(targetSvc) || !isValidKubernetesName(targetNS) {
+		log.Fatalf("service name and namespace must be valid Kubernetes names (alphanumeric and hyphens only)")
+	}
 	devSvc := targetSvc + "-dev"
 	remoteRPort := int32(remotePortFor(targetSvc, targetNS)) // relay listen port in cluster
 	instance := instanceID()
@@ -173,7 +181,21 @@ func main() {
 	must(err)
 	kpf, err := startKubectlPortForward(ctx, targetNS, relayName, localCtrl, relayCtrl)
 	must(err)
-	defer func() { _ = kpf.Process.Kill(); _, _ = kpf.Process.Wait() }()
+	defer func() {
+		if kpf.Process != nil {
+			_ = kpf.Process.Kill()
+			// Give the process a moment to exit gracefully
+			done := make(chan error, 1)
+			go func() { _, err := kpf.Process.Wait(); done <- err }()
+			select {
+			case <-done:
+				// Process exited
+			case <-time.After(2 * time.Second):
+				// Force kill if it doesn't exit gracefully
+				_ = kpf.Process.Kill()
+			}
+		}
+	}()
 
 	// Open a control connection to the relay and start multiplexing cluster->local
 	rc, err := newRelayClient(fmt.Sprintf("127.0.0.1:%d", localCtrl))
@@ -186,18 +208,25 @@ func main() {
 	// Run your app
 	child := exec.CommandContext(ctx, childCmd[0], childCmd[1:]...)
 	child.Stdout, child.Stderr, child.Stdin = os.Stdout, os.Stderr, os.Stdin
+
+	// Ensure lease cleanup happens regardless of how child exits
+	defer func() {
+		_ = cs.CoordinationV1().Leases(targetNS).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
+	}()
+
 	if runtime.GOOS == "linux" {
 		// Scope resolv.conf to the child (future outbound). Safe even if unused.
 		if err := runChildWithResolvLinux(ctx, child); err != nil {
-			_ = cs.CoordinationV1().Leases(targetNS).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
 			log.Fatalf("child start: %v", err)
 		}
 	} else {
 		if err := child.Start(); err != nil {
-			_ = cs.CoordinationV1().Leases(targetNS).Delete(context.Background(), leaseName, metav1.DeleteOptions{})
 			log.Fatalf("child start: %v", err)
 		}
-		go func() { _ = child.Wait(); cancel() }()
+		go func() {
+			_ = child.Wait()
+			cancel() // Signal that child has exited
+		}()
 	}
 
 	// Wait for signal
@@ -263,13 +292,15 @@ func (rc *relayClient) loop(localAppPort int) {
 			rc.streams.Store(fr.streamID, app)
 			// pump app -> relay as DATA frames
 			go func(id uint32, a net.Conn) {
+				defer func() {
+					_ = a.Close()
+					rc.streams.Delete(id)
+				}()
 				buf := make([]byte, 64<<10)
 				for {
 					n, err := a.Read(buf)
 					if n > 0 {
 						if err := rc.sendFrame(tData, id, buf[:n]); err != nil {
-							_ = a.Close()
-							rc.streams.Delete(id)
 							return
 						}
 					}
@@ -279,8 +310,6 @@ func (rc *relayClient) loop(localAppPort int) {
 						} else {
 							_ = rc.sendFrame(tRst, id, nil)
 						}
-						_ = a.Close()
-						rc.streams.Delete(id)
 						return
 					}
 				}
@@ -634,18 +663,27 @@ func startKubectlPortForward(ctx context.Context, ns, name string, local, remote
 
 func waitForPodIP(ctx context.Context, cs *kubernetes.Clientset, ns, selector string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		pods, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
-		if err == nil {
-			for _, p := range pods.Items {
-				if p.Status.PodIP != "" {
-					return p.Status.PodIP, nil
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("context cancelled while waiting for relay pod IP: %v", ctx.Err())
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return "", fmt.Errorf("timed out waiting for relay pod IP")
+			}
+			pods, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
+			if err == nil {
+				for _, p := range pods.Items {
+					if p.Status.PodIP != "" {
+						return p.Status.PodIP, nil
+					}
 				}
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
 	}
-	return "", fmt.Errorf("timed out waiting for relay pod IP")
 }
 
 /* ---------- Linkerd: HTTPRoute / GRPCRoute (version-flexible) ---------- */
@@ -990,28 +1028,45 @@ func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+func isValidKubernetesName(name string) bool {
+	if len(name) == 0 || len(name) > 253 {
+		return false
+	}
+	// Kubernetes names must be lowercase alphanumeric characters and hyphens
+	// Cannot start or end with hyphen
+	if name[0] == '-' || name[len(name)-1] == '-' {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 /* ---------- DNS Server ---------- */
 
 func recordsForAllServices(ctx context.Context, cs *kubernetes.Clientset) map[string]string {
 	records := make(map[string]string)
-	
+
 	// Get all services from all namespaces
 	services, err := cs.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("Warning: failed to list services for DNS: %v", err)
 		return records
 	}
-	
+
 	for _, svc := range services.Items {
 		// Create DNS record for service.namespace.svc.cluster.local
 		fqdn := fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
 		records[fqdn] = svc.Spec.ClusterIP
-		
+
 		// Also create record for service.namespace
 		shortName := fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)
 		records[shortName] = svc.Spec.ClusterIP
 	}
-	
+
 	return records
 }
 
@@ -1019,11 +1074,11 @@ func startOptionalDNS(records map[string]string) error {
 	if runtime.GOOS != "darwin" {
 		return nil // DNS server only needed on macOS
 	}
-	
+
 	if len(records) == 0 {
 		return nil // No records to serve
 	}
-	
+
 	// Start DNS server on port 1053
 	addr := "127.0.0.1:1053"
 	pc, err := net.ListenPacket("udp", addr)
@@ -1031,40 +1086,47 @@ func startOptionalDNS(records map[string]string) error {
 		log.Printf("Warning: failed to start DNS server: %v", err)
 		return err
 	}
-	
+
 	log.Printf("DNS server started on %s with %d records", addr, len(records))
-	
+
 	go func() {
 		defer pc.Close()
 		buffer := make([]byte, 512)
-		
+
 		for {
 			n, clientAddr, err := pc.ReadFrom(buffer)
 			if err != nil {
-				log.Printf("DNS read error: %v", err)
-				continue
+				// Check for fatal errors that should stop the server
+				if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+					log.Printf("DNS temporary error: %v", err)
+					continue
+				}
+				log.Printf("DNS fatal error, stopping server: %v", err)
+				return
 			}
-			
+
 			// Simple DNS response (just return the IP for A records)
 			// This is a minimal implementation - in production you'd want a proper DNS library
 			response := createSimpleDNSResponse(buffer[:n], records)
 			if len(response) > 0 {
-				pc.WriteTo(response, clientAddr)
+				if _, err := pc.WriteTo(response, clientAddr); err != nil {
+					log.Printf("DNS write error: %v", err)
+				}
 			}
 		}
 	}()
-	
+
 	return nil
 }
 
 func createSimpleDNSResponse(query []byte, records map[string]string) []byte {
 	// This is a very basic DNS response implementation
 	// For production use, you'd want to use a proper DNS library like github.com/miekg/dns
-	
+
 	if len(query) < 12 {
 		return nil
 	}
-	
+
 	// Extract the question name from the DNS query
 	// This is a simplified parser - real DNS parsing is more complex
 	questionStart := 12
@@ -1081,39 +1143,39 @@ func createSimpleDNSResponse(query []byte, records map[string]string) []byte {
 		name += string(query[i+1 : i+1+length])
 		i += length
 	}
-	
+
 	// Look up the name in our records
 	ip, exists := records[name]
 	if !exists {
 		return nil // No record found
 	}
-	
+
 	// Parse IP address
 	ipAddr := net.ParseIP(ip)
 	if ipAddr == nil {
 		return nil
 	}
-	
+
 	// Create a simple DNS response
 	// This is a minimal implementation - proper DNS responses are more complex
 	response := make([]byte, len(query))
 	copy(response, query)
-	
+
 	// Set response flags (QR=1, AA=1, RA=1)
 	response[2] = 0x81
 	response[3] = 0x80
-	
+
 	// Set answer count to 1
 	response[6] = 0x00
 	response[7] = 0x01
-	
+
 	// Add the answer record
 	response = append(response, query[questionStart:i+5]...) // Copy question
-	response = append(response, 0x00, 0x01) // Type A
-	response = append(response, 0x00, 0x01) // Class IN
-	response = append(response, 0x00, 0x00, 0x00, 0x3c) // TTL 60 seconds
-	response = append(response, 0x00, 0x04) // Data length 4 bytes
-	response = append(response, ipAddr.To4()...) // IP address
-	
+	response = append(response, 0x00, 0x01)                  // Type A
+	response = append(response, 0x00, 0x01)                  // Class IN
+	response = append(response, 0x00, 0x00, 0x00, 0x3c)      // TTL 60 seconds
+	response = append(response, 0x00, 0x04)                  // Data length 4 bytes
+	response = append(response, ipAddr.To4()...)             // IP address
+
 	return response
 }

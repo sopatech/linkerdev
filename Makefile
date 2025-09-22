@@ -13,8 +13,6 @@ release: ## Create a new release (usage: make release VERSION=v0.1.0-alpha6)
 		exit 1; \
 	fi
 	@echo "🚀 Creating release $(VERSION)..."
-	@echo "📝 Creating release branch..."
-	git checkout -b release/$(VERSION)
 	@echo "📝 Updating version in main.go..."
 	sed -i.bak 's/var version = ".*"/var version = "$(VERSION)"/' cmd/linkerdev/main.go
 	rm cmd/linkerdev/main.go.bak
@@ -26,19 +24,9 @@ release: ## Create a new release (usage: make release VERSION=v0.1.0-alpha6)
 	git commit -m "Release $(VERSION)"
 	@echo "🏷️  Creating tag $(VERSION)..."
 	git tag $(VERSION)
-	@echo "📤 Pushing branch and tag..."
-	git push origin release/$(VERSION)
-	git push origin $(VERSION)
-	@echo "✅ Release $(VERSION) created successfully!"
-	@echo "🔄 Switching back to main..."
-	git checkout main
-	@echo "📝 Merging release branch..."
-	git merge release/$(VERSION) --no-ff -m "Merge release $(VERSION)"
-	@echo "📤 Pushing main..."
+	@echo "📤 Pushing commit and tag..."
 	git push origin main
-	@echo "🧹 Cleaning up release branch..."
-	git branch -d release/$(VERSION)
-	git push origin --delete release/$(VERSION)
+	git push origin $(VERSION)
 	@echo "🎉 Release $(VERSION) completed!"
 
 build: ## Build the linkerdev CLI locally
