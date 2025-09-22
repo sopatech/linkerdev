@@ -14,11 +14,11 @@ import (
 )
 
 // EnsureRelay creates or updates the relay deployment
-func EnsureRelay(ctx context.Context, cs *kubernetes.Clientset, ns string, remoteRPort int32, lease *coordv1.Lease, instance string) (string, error) {
+func EnsureRelay(ctx context.Context, cs *kubernetes.Clientset, ns string, remoteRPort int32, lease *coordv1.Lease, instance, version string) (string, error) {
 	name := "linkerdev-relay"
 
 	_, err := cs.AppsV1().Deployments(ns).Patch(ctx, name, types.ApplyPatchType,
-		[]byte(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"`+name+`","namespace":"`+ns+`","labels":{"app.kdvwrap/owned":"true","app.kdvwrap/instance":"`+instance+`"},"ownerReferences":[{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","name":"`+lease.Name+`","uid":"`+string(lease.UID)+`","controller":true,"blockOwnerDeletion":true}]},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"`+name+`"}},"template":{"metadata":{"labels":{"app":"`+name+`","app.kdvwrap/owned":"true","app.kdvwrap/instance":"`+instance+`"}},"spec":{"containers":[{"name":"relay","image":"linkerdev-relay:latest","ports":[{"name":"relay","containerPort":`+string(rune(remoteRPort))+`,"protocol":"TCP"}]}]}}}}`),
+		[]byte(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"`+name+`","namespace":"`+ns+`","labels":{"app.kdvwrap/owned":"true","app.kdvwrap/instance":"`+instance+`"},"ownerReferences":[{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","name":"`+lease.Name+`","uid":"`+string(lease.UID)+`","controller":true,"blockOwnerDeletion":true}]},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"`+name+`"}},"template":{"metadata":{"labels":{"app":"`+name+`","app.kdvwrap/owned":"true","app.kdvwrap/instance":"`+instance+`"}},"spec":{"containers":[{"name":"relay","image":"ghcr.io/sopatech/linkerdev-relay:`+version+`","args":["--listen","`+fmt.Sprintf("%d", remoteRPort)+`","--control","18080"],"ports":[{"name":"ctrl","containerPort":18080,"protocol":"TCP"},{"name":"rev","containerPort":`+fmt.Sprintf("%d", remoteRPort)+`,"protocol":"TCP"}],"readinessProbe":{"httpGet":{"path":"/healthz","port":18080},"initialDelaySeconds":1,"periodSeconds":2,"failureThreshold":3}}}]}}}}`),
 		metav1.PatchOptions{FieldManager: "linkerdev"})
 
 	if err != nil {

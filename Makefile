@@ -14,7 +14,7 @@ release: ## Create a new release (usage: make release VERSION=v0.1.0-alpha6)
 	fi
 	@echo "🚀 Creating release $(VERSION)..."
 	@echo "📝 Updating version in main.go..."
-	sed -i.bak 's/var version = ".*"/var version = "$(VERSION)"/' cmd/linkerdev/main.go
+	sed -i.bak 's/const version = ".*"/const version = "$(VERSION)"/' cmd/linkerdev/main.go
 	rm cmd/linkerdev/main.go.bak
 	@echo "📝 Updating version in relay main.go..."
 	sed -i.bak 's/var version = ".*"/var version = "$(VERSION)"/' cmd/relay/main.go
