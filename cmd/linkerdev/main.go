@@ -35,6 +35,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miekg/dns"
 	appsV1 "k8s.io/api/apps/v1"
 	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1095,103 +1096,47 @@ func startOptionalDNS(records map[string]string) error {
 		return nil // No records to serve
 	}
 
-	// Start DNS server on port 1053
-	addr := "127.0.0.1:1053"
-	pc, err := net.ListenPacket("udp", addr)
-	if err != nil {
-		log.Printf("Warning: failed to start DNS server: %v", err)
-		return err
+	// Create DNS server
+	server := &dns.Server{
+		Addr: "127.0.0.1:1053",
+		Net:  "udp",
 	}
 
-	log.Printf("DNS server started on %s with %d records", addr, len(records))
+	// Set up DNS handler
+	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Authoritative = true
 
+		for _, q := range r.Question {
+			if q.Qtype == dns.TypeA {
+				// Look up the record
+				if ip, exists := records[q.Name]; exists {
+					rr, err := dns.NewRR(fmt.Sprintf("%s 60 IN A %s", q.Name, ip))
+					if err == nil {
+						m.Answer = append(m.Answer, rr)
+					}
+				}
+			}
+		}
+
+		// If no answer found, return NXDOMAIN
+		if len(m.Answer) == 0 {
+			m.Rcode = dns.RcodeNameError
+		}
+
+		w.WriteMsg(m)
+	})
+
+	log.Printf("DNS server started on %s with %d records", server.Addr, len(records))
+
+	// Start server in goroutine
 	go func() {
-		defer pc.Close()
-		buffer := make([]byte, 512)
-
-		for {
-			n, clientAddr, err := pc.ReadFrom(buffer)
-			if err != nil {
-				// Check for fatal errors that should stop the server
-				if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-					log.Printf("DNS temporary error: %v", err)
-					continue
-				}
-				log.Printf("DNS fatal error, stopping server: %v", err)
-				return
-			}
-
-			// Simple DNS response (just return the IP for A records)
-			// This is a minimal implementation - in production you'd want a proper DNS library
-			response := createSimpleDNSResponse(buffer[:n], records)
-			if len(response) > 0 {
-				if _, err := pc.WriteTo(response, clientAddr); err != nil {
-					log.Printf("DNS write error: %v", err)
-				}
-			}
+		if err := server.ListenAndServe(); err != nil {
+			log.Printf("DNS server error: %v", err)
 		}
 	}()
 
 	return nil
 }
 
-func createSimpleDNSResponse(query []byte, records map[string]string) []byte {
-	// This is a very basic DNS response implementation
-	// For production use, you'd want to use a proper DNS library like github.com/miekg/dns
-
-	if len(query) < 12 {
-		return nil
-	}
-
-	// Extract the question name from the DNS query
-	// This is a simplified parser - real DNS parsing is more complex
-	questionStart := 12
-	var name string
-	var i int
-	for i = questionStart; i < len(query) && query[i] != 0; i++ {
-		length := int(query[i])
-		if i+length >= len(query) {
-			return nil
-		}
-		if len(name) > 0 {
-			name += "."
-		}
-		name += string(query[i+1 : i+1+length])
-		i += length
-	}
-
-	// Look up the name in our records
-	ip, exists := records[name]
-	if !exists {
-		return nil // No record found
-	}
-
-	// Parse IP address
-	ipAddr := net.ParseIP(ip)
-	if ipAddr == nil {
-		return nil
-	}
-
-	// Create a simple DNS response
-	// This is a minimal implementation - proper DNS responses are more complex
-	response := make([]byte, len(query))
-	copy(response, query)
-
-	// Set response flags (QR=1, AA=1, RA=1)
-	response[2] = 0x81
-	response[3] = 0x80
-
-	// Set answer count to 1
-	response[6] = 0x00
-	response[7] = 0x01
-
-	// Add the answer record
-	response = append(response, query[questionStart:i+5]...) // Copy question
-	response = append(response, 0x00, 0x01)                  // Type A
-	response = append(response, 0x00, 0x01)                  // Class IN
-	response = append(response, 0x00, 0x00, 0x00, 0x3c)      // TTL 60 seconds
-	response = append(response, 0x00, 0x04)                  // Data length 4 bytes
-	response = append(response, ipAddr.To4()...)             // IP address
-
-	return response
-}
