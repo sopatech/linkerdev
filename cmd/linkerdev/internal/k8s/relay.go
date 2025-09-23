@@ -9,26 +9,23 @@ import (
 	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
-// EnsureRelay creates or updates the relay deployment
+// EnsureRelay checks if the relay deployment exists and is running
 func EnsureRelay(ctx context.Context, cs *kubernetes.Clientset, ns string, remoteRPort int32, lease *coordv1.Lease, instance, version string) (string, error) {
 	name := "linkerdev-relay"
 
-	_, err := cs.AppsV1().Deployments(ns).Patch(ctx, name, types.ApplyPatchType,
-		[]byte(`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"`+name+`","namespace":"`+ns+`","labels":{"app.kdvwrap/owned":"true","app.kdvwrap/instance":"`+instance+`"},"ownerReferences":[{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","name":"`+lease.Name+`","uid":"`+string(lease.UID)+`","controller":true,"blockOwnerDeletion":true}]},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"`+name+`"}},"template":{"metadata":{"labels":{"app":"`+name+`","app.kdvwrap/owned":"true","app.kdvwrap/instance":"`+instance+`"}},"spec":{"containers":[{"name":"relay","image":"ghcr.io/sopatech/linkerdev-relay:`+version+`","args":["--listen","`+fmt.Sprintf("%d", remoteRPort)+`","--control","18080"],"ports":[{"name":"ctrl","containerPort":18080,"protocol":"TCP"},{"name":"rev","containerPort":`+fmt.Sprintf("%d", remoteRPort)+`,"protocol":"TCP"}],"readinessProbe":{"httpGet":{"path":"/healthz","port":18080},"initialDelaySeconds":1,"periodSeconds":2,"failureThreshold":3}}}]}}}}`),
-		metav1.PatchOptions{FieldManager: "linkerdev"})
-
+	// Check if the relay deployment exists
+	_, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("linkerdev relay is not installed in the cluster. Please run 'linkerdev install' first")
 	}
 
 	// Wait for pod to be ready
 	ip, err := WaitForPodIP(ctx, cs, ns, "app="+name, 30*time.Second)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("linkerdev relay is not ready. Please check if it's running with 'kubectl get pods -n %s -l app=%s'", ns, name)
 	}
 
 	return fmt.Sprintf("%s:%d", ip, remoteRPort), nil
