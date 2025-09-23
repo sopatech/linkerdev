@@ -7,16 +7,45 @@ import (
 
 	coordv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
 // EnsureLease creates or updates a lease for instance tracking
 func EnsureLease(ctx context.Context, cs *kubernetes.Clientset, ns, name, holder string) (*coordv1.Lease, error) {
-	result, err := cs.CoordinationV1().Leases(ns).Patch(ctx, name, types.ApplyPatchType,
-		[]byte(`{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"`+name+`","namespace":"`+ns+`","labels":{"app.kdvwrap/owned":"true","app.kdvwrap/instance":"`+holder+`"}},"spec":{"holderIdentity":"`+holder+`","leaseDurationSeconds":30,"renewTime":"`+time.Now().Format(time.RFC3339)+`"}}`),
-		metav1.PatchOptions{FieldManager: "linkerdev"})
-
+	now := time.Now()
+	renewTime := metav1.NewMicroTime(now)
+	
+	lease := &coordv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels: map[string]string{
+				"app.kdvwrap/owned":   "true",
+				"app.kdvwrap/instance": holder,
+			},
+		},
+		Spec: coordv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: func() *int32 { v := int32(30); return &v }(),
+			RenewTime:            &renewTime,
+		},
+	}
+	
+	// Try to get existing lease first
+	existing, err := cs.CoordinationV1().Leases(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		// Lease doesn't exist, create it
+		result, err := cs.CoordinationV1().Leases(ns).Create(ctx, lease, metav1.CreateOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+	
+	// Lease exists, update it
+	existing.Spec = lease.Spec
+	existing.Labels = lease.Labels
+	result, err := cs.CoordinationV1().Leases(ns).Update(ctx, existing, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
